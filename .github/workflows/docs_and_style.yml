@@ -76,8 +76,8 @@ jobs:
         with:
           python-version: '3.x'
       - run: pip install pre-commit
-      - name: Run the comment-slop unit tests
-        run: python -m unittest test.test_comment_slop -v
+      - name: Run focused Python unit tests
+        run: python -m unittest test.test_comment_slop test.test_validate_llamacpp_selection -v
 
       - name: Run pre-commit on the changed files
         # Scoped to what the change touches; running repo-wide would fail on drift that

@@ -7,6 +7,11 @@ on:
         description: 'Run in lite mode (smallest model only)'
         type: boolean
         default: false
+      models:
+        description: 'Optional comma-separated model IDs (empty uses hot models)'
+        type: string
+        required: false
+        default: ''
   pull_request:
     types: [opened, synchronize, reopened, labeled]
   merge_group:
@@ -717,6 +722,8 @@ jobs:
 
       - name: Run validation with lemond
         shell: PowerShell
+        env:
+          LLAMACPP_TEST_MODELS: ${{ inputs.models || '' }}
         run: |
           $ErrorActionPreference = "Stop"
           $port = 13305
@@ -798,6 +805,14 @@ jobs:
             if ($channel) {
               $validationArgs += "--channel"
               $validationArgs += $channel
+            }
+
+            foreach ($modelValue in ($env:LLAMACPP_TEST_MODELS -split ",")) {
+              $model = $modelValue.Trim()
+              if ($model) {
+                $validationArgs += "--model"
+                $validationArgs += $model
+              }
             }
 
             if ("${{ env.LITE_MODE }}" -eq "true") {

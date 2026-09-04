@@ -5,14 +5,15 @@ Validate a llama.cpp backend release against all "hot" llamacpp models.
 Usage:
     python test/validate_llamacpp.py --backend vulkan
     python test/validate_llamacpp.py --backend rocm
+    python test/validate_llamacpp.py --backend vulkan --model MODEL_ID
 
 This script expects `lemond` to already be running on the target port.
 
 This script:
-1. Queries `/api/v1/models?show_all=true` and selects models with recipe
-   `llamacpp` and label `hot`
+1. Queries `/api/v1/models?show_all=true` and selects either the requested
+   llama.cpp models or all models with recipe `llamacpp` and label `hot`
 2. Installs the requested llamacpp backend via `POST /api/v1/install`
-3. For each hot model, loads it with the requested backend, sends a
+3. For each selected model, loads it with the requested backend, sends a
    `chat/completions` request, queries `/api/v1/stats`, and unloads it
 4. Outputs a JSON results file for CI consumption
 """
@@ -24,14 +25,21 @@ import os
 import shutil
 import sys
 import tempfile
+from urllib.parse import quote
 
 import requests
 
 from utils.server_base import _auth_headers, unload_all_models, wait_for_server
 from utils.test_models import PORT, TIMEOUT_DEFAULT
+from utils.validation_model_selection import (
+    ModelSelectionError,
+    add_model_selection_arguments,
+    select_llamacpp_models,
+)
 
 TIMEOUT_HEALTH = 60
 TIMEOUT_INFERENCE = 1800  # 30 minutes; large models may need 60+ GB download
+VALIDATION_CTX_SIZE = 4096
 CHAT_PROMPT = [
     {"role": "user", "content": "What is 2+2? Reply in one sentence."},
 ]
@@ -92,8 +100,8 @@ def require_running_server(base_url, port):
     )
 
 
-def get_hot_llamacpp_models(base_url):
-    """Return the catalog entries for hot llamacpp models from the API."""
+def get_model_catalog(base_url):
+    """Return all model catalog entries from the API."""
     response, body = request_json(
         "GET",
         f"{base_url}/models?show_all=true",
@@ -104,14 +112,29 @@ def get_hot_llamacpp_models(base_url):
             f"Failed to query model catalog: HTTP {response.status_code} - {body}"
         )
 
-    hot_models = []
-    for model in body.get("data", []):
-        labels = model.get("labels", [])
-        if model.get("recipe") == "llamacpp" and "hot" in labels:
-            hot_models.append(model)
+    return body.get("data", [])
 
-    hot_models.sort(key=lambda model: model["id"])
-    return hot_models
+
+def get_builtin_model(base_url, canonical_model_id):
+    """Resolve one canonical built-in model from the API."""
+    encoded_model_id = quote(canonical_model_id, safe="")
+    response, body = request_json(
+        "GET",
+        f"{base_url}/models/{encoded_model_id}",
+        timeout=TIMEOUT_DEFAULT,
+    )
+    if response.status_code == 404:
+        return None
+    if response.status_code != 200:
+        raise RuntimeError(
+            f"Failed to query built-in model '{canonical_model_id}': "
+            f"HTTP {response.status_code} - {body}"
+        )
+    if not isinstance(body, dict):
+        raise RuntimeError(
+            f"Built-in model '{canonical_model_id}' returned an invalid response"
+        )
+    return body
 
 
 def set_rocm_channel(base_url, channel):
@@ -172,7 +195,11 @@ def test_model(base_url, model_name, backend, max_tokens=50):
             "POST",
             f"{base_url}/load",
             timeout=TIMEOUT_INFERENCE,
-            json={"model_name": model_name, "llamacpp_backend": backend},
+            json={
+                "model_name": model_name,
+                "llamacpp_backend": backend,
+                "ctx_size": VALIDATION_CTX_SIZE,
+            },
         )
         if load_resp.status_code != 200:
             return (
@@ -192,6 +219,8 @@ def test_model(base_url, model_name, backend, max_tokens=50):
                 for model in health_body.get("all_models_loaded", [])
             }
             loaded_model = loaded.get(model_name, {})
+            if not loaded_model and model_name.startswith("builtin."):
+                loaded_model = loaded.get(model_name.removeprefix("builtin."), {})
             recipe_options = loaded_model.get("recipe_options", {})
             actual_backend = recipe_options.get("llamacpp_backend")
             if actual_backend and actual_backend != backend:
@@ -252,7 +281,7 @@ def test_model(base_url, model_name, backend, max_tokens=50):
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Validate a llama.cpp backend against hot Lemonade models"
+        description="Validate a llama.cpp backend against selected Lemonade models"
     )
     parser.add_argument(
         "--backend",
@@ -294,11 +323,7 @@ def main():
         default=None,
         help="Directory to collect server log files into (for CI artifact upload)",
     )
-    parser.add_argument(
-        "--lite",
-        action="store_true",
-        help="Lite mode: only test the smallest hot model",
-    )
+    add_model_selection_arguments(parser)
     args = parser.parse_args()
 
     # Label used for output filenames and artifact names
@@ -318,23 +343,35 @@ def main():
     except requests.RequestException as exc:
         print(f"Warning: failed to unload pre-existing models: {exc}", flush=True)
 
-    hot_models = get_hot_llamacpp_models(base_url)
-    print(f"Found {len(hot_models)} hot llamacpp models:", flush=True)
-    for model in hot_models:
-        print(f"  - {model['id']} ({model.get('size', '?')} GB)", flush=True)
-
-    if not hot_models:
-        print("ERROR: No hot llamacpp models found!", file=sys.stderr, flush=True)
+    catalog = get_model_catalog(base_url) if not args.model else []
+    try:
+        selected_models = select_llamacpp_models(
+            catalog,
+            requested_model_ids=args.model,
+            lite=args.lite,
+            builtin_model_resolver=lambda model_id: get_builtin_model(
+                base_url, model_id
+            ),
+        )
+    except ModelSelectionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr, flush=True)
         sys.exit(1)
 
-    if args.lite and len(hot_models) > 1:
-        smallest = min(hot_models, key=lambda m: m.get("size", float("inf")))
+    selection_mode = "explicitly selected" if args.model else "hot"
+    print(
+        f"Found {len(selected_models)} {selection_mode} llamacpp models:",
+        flush=True,
+    )
+    for model in selected_models:
+        print(f"  - {model['id']} ({model.get('size', '?')} GB)", flush=True)
+
+    if args.lite:
+        selected = selected_models[0]
         print(
             f"Lite mode: testing only smallest model: "
-            f"{smallest['id']} ({smallest.get('size', '?')} GB)",
+            f"{selected['id']} ({selected.get('size', '?')} GB)",
             flush=True,
         )
-        hot_models = [smallest]
 
     if not args.skip_install:
         install_backend(base_url, args.backend)
@@ -342,11 +379,11 @@ def main():
     results = []
     all_passed = True
     try:
-        for model in hot_models:
+        for model in selected_models:
             model_name = model["id"]
             print(f"\nTesting: {model_name}", flush=True)
             success, response_text, stats = test_model(
-                base_url, model_name, args.backend
+                base_url, model.get("load_id", model_name), args.backend
             )
             result = {
                 "model": model_name,
