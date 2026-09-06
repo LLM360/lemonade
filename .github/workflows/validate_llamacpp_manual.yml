@@ -1,0 +1,29 @@
+name: Validate llama.cpp Manually
+
+on:
+  workflow_dispatch:
+    inputs:
+      lite:
+        description: 'Run in lite mode (smallest model only)'
+        type: boolean
+        default: false
+      models:
+        description: 'Optional comma-separated model IDs (empty uses hot models)'
+        type: string
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    name: Run manual validation
+    permissions:
+      contents: read
+    uses: ./.github/workflows/validate_llamacpp_core.yml
+    with:
+      lite: ${{ inputs.lite }}
+      models: ${{ inputs.models }}
+    secrets:
+      HUGGINGFACE_ACCESS_TOKEN: ${{ secrets.HUGGINGFACE_ACCESS_TOKEN }}

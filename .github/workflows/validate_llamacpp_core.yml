@@ -1,7 +1,7 @@
-name: Validate New llama.cpp Release
+name: Validate llama.cpp
 
 on:
-  workflow_dispatch:
+  workflow_call:
     inputs:
       lite:
         description: 'Run in lite mode (smallest model only)'
@@ -12,25 +12,62 @@ on:
         type: string
         required: false
         default: ''
+    secrets:
+      HUGGINGFACE_ACCESS_TOKEN:
+        required: false
+    outputs:
+      promotion_eligible:
+        value: ${{ jobs.plan.outputs.promotion_eligible }}
+      validation_matrix:
+        value: ${{ jobs.plan.outputs.matrix }}
+      llamacpp_release:
+        value: ${{ jobs.get-latest-releases.outputs.llamacpp_release }}
+      llamacpp_rocm_release:
+        value: ${{ jobs.get-latest-releases.outputs.llamacpp_rocm_release }}
+      llamacpp_lemonade_release:
+        value: ${{ jobs.get-latest-releases.outputs.llamacpp_lemonade_release }}
+      release_asset_manifest:
+        value: ${{ jobs.verify-release-assets.outputs.release_asset_manifest }}
+      ggml_update_backends:
+        value: ${{ jobs.verify-release-assets.outputs.ggml_update_backends }}
+      lemonade_update_backends:
+        value: ${{ jobs.verify-release-assets.outputs.lemonade_update_backends }}
+      rocm_update_backends:
+        value: ${{ jobs.verify-release-assets.outputs.rocm_update_backends }}
+      ggml_missing_count:
+        value: ${{ jobs.verify-release-assets.outputs.ggml_missing_count }}
+      rocm_nightly_missing_count:
+        value: ${{ jobs.verify-release-assets.outputs.rocm_nightly_missing_count }}
+      rocm_stable_missing_count:
+        value: ${{ jobs.verify-release-assets.outputs.rocm_stable_missing_count }}
+      cuda_missing_count:
+        value: ${{ jobs.verify-release-assets.outputs.cuda_missing_count }}
+      vulkan_available:
+        value: ${{ jobs.verify-release-assets.outputs.vulkan_available }}
+      cpu_available:
+        value: ${{ jobs.verify-release-assets.outputs.cpu_available }}
+      metal_available:
+        value: ${{ jobs.verify-release-assets.outputs.metal_available }}
+      rocm_nightly_available:
+        value: ${{ jobs.verify-release-assets.outputs.rocm_nightly_available }}
+      rocm_stable_available:
+        value: ${{ jobs.verify-release-assets.outputs.rocm_stable_available }}
+      cuda_available:
+        value: ${{ jobs.verify-release-assets.outputs.cuda_available }}
   pull_request:
-    types: [opened, synchronize, reopened, labeled]
+    types: [opened, synchronize, reopened, labeled, unlabeled, closed]
   merge_group:
-  schedule:
-    # Sunday at 12:00 PM ET (17:00 UTC, 16:00 UTC during EDT)
-    - cron: "0 16 * * 0"
 
 permissions:
-  contents: write
-  pull-requests: write
+  contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name == 'pull_request' && 'pr' || github.run_id }}
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && format('pr-{0}', github.event.pull_request.number) || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   LEMONADE_CI_MODE: "True"
   PYTHONIOENCODING: utf-8
-  HF_TOKEN: ${{ secrets.HUGGINGFACE_ACCESS_TOKEN }}
 
 jobs:
   plan:
@@ -38,6 +75,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
+      promotion_eligible: ${{ steps.plan.outputs.promotion_eligible }}
     steps:
       - uses: actions/checkout@v5
       - name: Build validation matrix
@@ -126,6 +164,7 @@ jobs:
       rocm_nightly_available: ${{ steps.assets.outputs.rocm_nightly_available }}
       rocm_stable_available: ${{ steps.assets.outputs.rocm_stable_available }}
       cuda_available: ${{ steps.assets.outputs.cuda_available }}
+      release_asset_manifest: ${{ steps.manifest.outputs.release_asset_manifest }}
     steps:
       - uses: actions/checkout@v5
 
@@ -146,11 +185,15 @@ jobs:
           done
 
           gh api "repos/ggml-org/llama.cpp/releases/tags/${GGML_RELEASE}" \
-            --jq '.assets[].name' | sort > ggml_assets.txt
+            > ggml_release.json
           gh api "repos/lemonade-sdk/llamacpp-rocm/releases/tags/${ROCM_RELEASE}" \
-            --jq '.assets[].name' | sort > rocm_assets.txt
+            > rocm_release.json
           gh api "repos/lemonade-sdk/llama.cpp/releases/tags/${LEMONADE_RELEASE}" \
-            --jq '.assets[].name' | sort > lemonade_assets.txt
+            > lemonade_release.json
+
+          jq -r '.assets[].name' ggml_release.json | sort > ggml_assets.txt
+          jq -r '.assets[].name' rocm_release.json | sort > rocm_assets.txt
+          jq -r '.assets[].name' lemonade_release.json | sort > lemonade_assets.txt
 
           echo "ggml-org/llama.cpp assets for ${GGML_RELEASE}:"
           cat ggml_assets.txt
@@ -158,6 +201,19 @@ jobs:
           cat rocm_assets.txt
           echo "lemonade-sdk/llama.cpp assets for ${LEMONADE_RELEASE}:"
           cat lemonade_assets.txt
+
+      - name: Capture release asset manifest
+        id: manifest
+        env:
+          GGML_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_release }}
+          ROCM_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_rocm_release }}
+          LEMONADE_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_lemonade_release }}
+        run: >-
+          python -m test.utils.llamacpp_release_manifest
+          --release ggml-org/llama.cpp "$GGML_RELEASE" ggml_release.json
+          --release lemonade-sdk/llamacpp-rocm "$ROCM_RELEASE" rocm_release.json
+          --release lemonade-sdk/llama.cpp "$LEMONADE_RELEASE" lemonade_release.json
+          --github-output "$GITHUB_OUTPUT"
 
       - name: Verify expected asset families
         id: assets
@@ -256,8 +312,9 @@ jobs:
   build:
     name: Build
     needs: [get-latest-releases, verify-release-assets, plan]
-    # Label a PR `ci:upgrades` to opt it back in.
-    if: (github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'ci:upgrades')) && always() && !failure() && !cancelled()
+    # A new push cancels this run and requires the label to be reapplied, so
+    # runner authorization belongs to one reviewed head rather than the PR.
+    if: (github.event_name != 'pull_request' || (github.event.action == 'labeled' && github.event.label.name == 'ci:upgrades')) && always() && !failure() && !cancelled()
     runs-on: windows-latest
     steps:
       - name: Prepare Windows runner for long paths and stale workspace caches
@@ -634,6 +691,7 @@ jobs:
       - name: Run validation with lemond
         shell: PowerShell
         env:
+          HF_TOKEN: ${{ secrets.HUGGINGFACE_ACCESS_TOKEN }}
           LLAMACPP_TEST_MODELS: ${{ join(matrix.models, ',') }}
           LITE_MODE: ${{ matrix.lite }}
         run: |
@@ -798,6 +856,7 @@ jobs:
           name: validation-results-${{ matrix.channel && format('{0}-{1}', matrix.backend, matrix.channel) || matrix.backend }}
           path: llamacpp_validation_${{ matrix.channel && format('{0}-{1}', matrix.backend, matrix.channel) || matrix.backend }}.json
           retention-days: 30
+          if-no-files-found: error
 
       - name: Upload server logs
         if: always()
@@ -811,239 +870,6 @@ jobs:
       - name: Cleanup
         if: always()
         uses: ./.github/actions/cleanup-processes-windows
-
-  # ========================================================================
-  # Create PR if both validations passed (schedule or workflow_dispatch only)
-  # ========================================================================
-  create-pr:
-    name: Create update PR
-    needs: [get-latest-releases, verify-release-assets, validate]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
-    if: >-
-      (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') &&
-      needs.validate.result == 'success' &&
-      needs.verify-release-assets.result == 'success'
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Download validation results
-        uses: actions/download-artifact@v7
-        with:
-          pattern: validation-results-*
-          merge-multiple: true
-
-      - name: Update backend_versions.json with verified releases
-        shell: bash
-        env:
-          LLAMACPP_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_release }}
-          LLAMACPP_ROCM_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_rocm_release }}
-          LLAMACPP_LEMONADE_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_lemonade_release }}
-          LLAMACPP_GGML_UPDATE_BACKENDS: ${{ needs.verify-release-assets.outputs.ggml_update_backends }}
-          LLAMACPP_ROCM_UPDATE_BACKENDS: ${{ needs.verify-release-assets.outputs.rocm_update_backends }}
-          LLAMACPP_LEMONADE_UPDATE_BACKENDS: ${{ needs.verify-release-assets.outputs.lemonade_update_backends }}
-        run: |
-          set -euo pipefail
-
-          python3 - <<'PY'
-          import json
-          import os
-          import re
-          from pathlib import Path
-
-          RELEASE_RE = re.compile(r"^b[0-9]+$")
-
-          def parse_csv(value):
-              return [item.strip() for item in (value or "").split(",") if item.strip()]
-
-          def update(section, release, backends):
-              if not backends:
-                  return []
-              if not RELEASE_RE.match(release):
-                  raise SystemExit(f"Invalid llama.cpp release tag: {release}")
-              changed = []
-              for key in backends:
-                  if key not in section:
-                      raise SystemExit(f"Refusing to create missing llamacpp.{key}")
-                  if not isinstance(section[key], str):
-                      raise SystemExit(f"llamacpp.{key} must be a string")
-                  old = section[key]
-                  section[key] = release
-                  changed.append((key, old, release))
-              return changed
-
-          path = Path("src/cpp/resources/backend_versions.json")
-          data = json.loads(path.read_text(encoding="utf-8"))
-          section = data.get("llamacpp")
-          if not isinstance(section, dict):
-              raise SystemExit("backend_versions.json is missing a llamacpp object")
-
-          changes = []
-          changes += update(section, os.environ["LLAMACPP_RELEASE"], parse_csv(os.environ.get("LLAMACPP_GGML_UPDATE_BACKENDS", "")))
-          changes += update(section, os.environ["LLAMACPP_ROCM_RELEASE"], parse_csv(os.environ.get("LLAMACPP_ROCM_UPDATE_BACKENDS", "")))
-          changes += update(section, os.environ["LLAMACPP_LEMONADE_RELEASE"], parse_csv(os.environ.get("LLAMACPP_LEMONADE_UPDATE_BACKENDS", "")))
-
-          path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-
-          print("Updated llamacpp backend versions:")
-          if changes:
-              for key, old, new in changes:
-                  print(f"  llamacpp.{key}: {old} -> {new}")
-          else:
-              print("  none")
-          PY
-
-      - name: Generate PR body
-        shell: bash
-        env:
-          LLAMACPP_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_release }}
-          LLAMACPP_ROCM_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_rocm_release }}
-          LLAMACPP_LEMONADE_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_lemonade_release }}
-          LLAMACPP_GGML_UPDATE_BACKENDS: ${{ needs.verify-release-assets.outputs.ggml_update_backends }}
-          LLAMACPP_ROCM_UPDATE_BACKENDS: ${{ needs.verify-release-assets.outputs.rocm_update_backends }}
-          LLAMACPP_LEMONADE_UPDATE_BACKENDS: ${{ needs.verify-release-assets.outputs.lemonade_update_backends }}
-          VULKAN_AVAILABLE: ${{ needs.verify-release-assets.outputs.vulkan_available }}
-          CPU_AVAILABLE: ${{ needs.verify-release-assets.outputs.cpu_available }}
-          METAL_AVAILABLE: ${{ needs.verify-release-assets.outputs.metal_available }}
-          ROCM_NIGHTLY_AVAILABLE: ${{ needs.verify-release-assets.outputs.rocm_nightly_available }}
-          ROCM_STABLE_AVAILABLE: ${{ needs.verify-release-assets.outputs.rocm_stable_available }}
-          CUDA_AVAILABLE: ${{ needs.verify-release-assets.outputs.cuda_available }}
-          GGML_MISSING_COUNT: ${{ needs.verify-release-assets.outputs.ggml_missing_count }}
-          ROCM_NIGHTLY_MISSING_COUNT: ${{ needs.verify-release-assets.outputs.rocm_nightly_missing_count }}
-          ROCM_STABLE_MISSING_COUNT: ${{ needs.verify-release-assets.outputs.rocm_stable_missing_count }}
-          CUDA_MISSING_COUNT: ${{ needs.verify-release-assets.outputs.cuda_missing_count }}
-        run: |
-          python3 <<'PYEOF'
-          import json
-          import os
-
-          def parse_csv(value):
-              return [item.strip() for item in (value or "").split(",") if item.strip()]
-
-          def yes(name):
-              return os.environ.get(name, "false") == "true"
-
-          def pin_action(backend, release, enabled):
-              return release if enabled else "unchanged"
-
-          body_lines = []
-          llamacpp = os.environ.get("LLAMACPP_RELEASE", "unknown")
-          rocm_nightly = os.environ.get("LLAMACPP_ROCM_RELEASE", "unknown")
-          lemonade_release = os.environ.get("LLAMACPP_LEMONADE_RELEASE", "unknown")
-          ggml_updates = set(parse_csv(os.environ.get("LLAMACPP_GGML_UPDATE_BACKENDS", "")))
-          rocm_updates = set(parse_csv(os.environ.get("LLAMACPP_ROCM_UPDATE_BACKENDS", "")))
-          lemonade_updates = set(parse_csv(os.environ.get("LLAMACPP_LEMONADE_UPDATE_BACKENDS", "")))
-
-          pin_plan = {
-              "vulkan": pin_action("vulkan", llamacpp, "vulkan" in ggml_updates),
-              "cpu": pin_action("cpu", llamacpp, "cpu" in ggml_updates),
-              "metal": pin_action("metal", llamacpp, "metal" in ggml_updates),
-              "rocm-nightly": pin_action("rocm-nightly", rocm_nightly, "rocm-nightly" in rocm_updates),
-              "rocm-stable": pin_action("rocm-stable", lemonade_release, "rocm-stable" in lemonade_updates),
-              "cuda": pin_action("cuda", lemonade_release, "cuda" in lemonade_updates),
-          }
-
-          body_lines.append("## Auto-update llama.cpp backends")
-          body_lines.append("")
-          body_lines.append("This PR updates only backend pins whose expected release assets were found.")
-          body_lines.append("")
-          body_lines.append(f"- **ggml-org/llama.cpp candidate**: `{llamacpp}`")
-          body_lines.append(f"- **lemonade-sdk/llamacpp-rocm candidate**: `{rocm_nightly}`")
-          body_lines.append(f"- **lemonade-sdk/llama.cpp candidate**: `{lemonade_release}`")
-          body_lines.append("")
-          body_lines.append("| Backend | Pin action | Asset check |")
-          body_lines.append("|---|---|---|")
-          body_lines.append(f"| `vulkan` | `{pin_plan['vulkan']}` | {'complete' if yes('VULKAN_AVAILABLE') else 'incomplete'} |")
-          body_lines.append(f"| `cpu` | `{pin_plan['cpu']}` | {'complete' if yes('CPU_AVAILABLE') else 'incomplete'} |")
-          body_lines.append(f"| `metal` | `{pin_plan['metal']}` | {'complete' if yes('METAL_AVAILABLE') else 'incomplete'} |")
-          body_lines.append(f"| `rocm-nightly` | `{pin_plan['rocm-nightly']}` | {'complete' if yes('ROCM_NIGHTLY_AVAILABLE') else 'incomplete'} |")
-          body_lines.append(f"| `rocm-stable` | `{pin_plan['rocm-stable']}` | {'complete' if yes('ROCM_STABLE_AVAILABLE') else 'incomplete'} |")
-          body_lines.append(f"| `cuda` | `{pin_plan['cuda']}` | {'complete' if yes('CUDA_AVAILABLE') else 'incomplete'} |")
-          body_lines.append("")
-          body_lines.append("Missing asset counts:")
-          body_lines.append(f"- ggml-org/llama.cpp: `{os.environ.get('GGML_MISSING_COUNT', 'unknown')}`")
-          body_lines.append(f"- lemonade-sdk/llamacpp-rocm rocm-nightly: `{os.environ.get('ROCM_NIGHTLY_MISSING_COUNT', 'unknown')}`")
-          body_lines.append(f"- lemonade-sdk/llama.cpp rocm-stable: `{os.environ.get('ROCM_STABLE_MISSING_COUNT', 'unknown')}`")
-          body_lines.append(f"- lemonade-sdk/llama.cpp cuda: `{os.environ.get('CUDA_MISSING_COUNT', 'unknown')}`")
-          body_lines.append("")
-          body_lines.append("CUDA remains asset-gated only until a CUDA self-hosted runner is enabled.")
-          body_lines.append("")
-          body_lines.append("## Validation Results")
-          body_lines.append("")
-          body_lines.append("| Model | Result | Response | input_tokens | output_tokens | time_to_first_token | tokens_per_second |")
-          body_lines.append("|-------|--------|----------|--------------|---------------|---------------------|-------------------|")
-
-          for backend in ["vulkan", "rocm-stable", "rocm-nightly"]:
-              # Labels match the artifact names produced by the validate job
-              results_file = f"llamacpp_validation_{backend}.json"
-              if not os.path.isfile(results_file):
-                  body_lines.append(f"| _{backend}: no results_ | | | | | | |")
-                  continue
-              with open(results_file, "r") as f:
-                  results = json.load(f)
-              for r in results:
-                  status = "PASS" if r["pass"] else "FAIL"
-                  # Truncate response for table readability
-                  resp = str(r.get("response", ""))[:80].replace("|", "\\|").replace("\n", " ")
-                  ttft = r.get("time_to_first_token", "N/A")
-                  if isinstance(ttft, float):
-                      ttft = f"{ttft:.3f}s"
-                  tps = r.get("tokens_per_second", "N/A")
-                  if isinstance(tps, float):
-                      tps = f"{tps:.1f}"
-                  body_lines.append(
-                      f"| {r['model']} ({backend}) | {status} | {resp} | "
-                      f"{r.get('input_tokens', 'N/A')} | {r.get('output_tokens', 'N/A')} | "
-                      f"{ttft} | {tps} |"
-                  )
-
-          body_lines.append("")
-          body_lines.append("---")
-          body_lines.append("*Auto-generated by validate_llamacpp workflow*")
-
-          body = "\n".join(body_lines)
-          with open("pr_body.md", "w") as f:
-              f.write(body)
-          PYEOF
-
-      - name: Create Pull Request
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          LLAMACPP_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_release }}
-          LLAMACPP_ROCM_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_rocm_release }}
-          LLAMACPP_LEMONADE_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_lemonade_release }}
-        run: |
-          BRANCH="auto/llamacpp-update-${LLAMACPP_RELEASE}-${LLAMACPP_LEMONADE_RELEASE}-${LLAMACPP_ROCM_RELEASE}"
-
-          # Check if a PR already exists for this update
-          EXISTING_PR=$(gh pr list --head "$BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
-          if [ -n "$EXISTING_PR" ]; then
-            echo "PR #$EXISTING_PR already exists for branch $BRANCH. Skipping."
-            exit 0
-          fi
-
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-
-          # Skip if backend_versions.json is already up to date
-          if git diff --quiet src/cpp/resources/backend_versions.json; then
-            echo "backend_versions.json is unchanged — nothing to update."
-            exit 0
-          fi
-
-          git checkout -b "$BRANCH"
-          git add src/cpp/resources/backend_versions.json
-          git commit -m "Update llama.cpp to ${LLAMACPP_RELEASE}, rocm-stable to ${LLAMACPP_LEMONADE_RELEASE}, rocm-nightly to ${LLAMACPP_ROCM_RELEASE}"
-          git push origin "$BRANCH"
-
-          gh pr create \
-            --title "Update llama.cpp to ${LLAMACPP_RELEASE}" \
-            --body-file pr_body.md \
-            --base main \
-            --head "$BRANCH"
-
   # Gate job that ensures: 1. in the merge queue, all jobs in `needs:` ran
   # successfully (otherwise the merge is blocked), and 2. these jobs do not need
   # to run on ordinary pull request pushes.

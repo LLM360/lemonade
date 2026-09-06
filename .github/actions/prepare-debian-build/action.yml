@@ -1,5 +1,5 @@
 name: Prepare Debian Build
-description: Extract version from git and create Debian packaging metadata from template
+description: Resolve the Debian version and create packaging metadata from template
 
 inputs:
   release:
@@ -17,14 +17,15 @@ outputs:
 runs:
   using: composite
   steps:
-    - name: Get version from git describe
+    - name: Resolve Debian version
       id: get_version
       shell: bash
       run: |
-        VERSION=$(git describe --tags --always)
-        # Strip leading 'v' for Debian version compatibility
-        DEB_VERSION=$(echo "${VERSION}" | sed 's/^v//')
-        echo "version=${DEB_VERSION}" >> $GITHUB_OUTPUT
+        DEB_VERSION=$(
+          "${GITHUB_ACTION_PATH}/../../scripts/resolve_debian_version.sh" \
+            "${{ inputs.release }}"
+        )
+        echo "version=${DEB_VERSION}" >> "$GITHUB_OUTPUT"
 
     - name: Create Debian packaging metadata
       shell: bash

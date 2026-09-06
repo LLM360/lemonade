@@ -43,7 +43,7 @@ VALIDATION_CTX_SIZE = 4096
 CHAT_PROMPT = [
     {"role": "user", "content": "What is 2+2? Reply in one sentence."},
 ]
-IFM_CONTROL_PREFIXES = ("<ifm|", "</ifm|")
+IFM_CONTROL_PREFIXES = ("<ifm|", "</ifm|", "<|ifm|")
 
 
 def find_raw_ifm_control_marker(value, field):

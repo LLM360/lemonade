@@ -505,6 +505,27 @@ class LlamaCppValidationRuntimeTests(unittest.TestCase):
                     rf"(?i)raw IFM control marker.*{response_field}",
                 )
 
+    def test_model_rejects_ifm_chat_boundary_tokens(self) -> None:
+        for token in ("<|ifm|im_start|>", "<|ifm|im_end|>"):
+            with self.subTest(token=token):
+                message = {"content": f"answer {token} leaked"}
+                with (
+                    mock.patch.object(
+                        VALIDATION,
+                        "request_json",
+                        side_effect=self.request_json_for_chat(message),
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    success, error, _stats = VALIDATION.test_model(
+                        "http://localhost:13305/api/v1",
+                        "builtin.Test-Llama",
+                        "vulkan",
+                    )
+
+                self.assertFalse(success)
+                self.assertRegex(error, "(?i)raw IFM control marker.*content")
+
     def test_model_accepts_clean_nested_tool_call_fields(self) -> None:
         message = {
             "content": "I will use the lookup tool.",

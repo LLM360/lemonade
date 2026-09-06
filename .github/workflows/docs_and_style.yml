@@ -80,7 +80,11 @@ jobs:
         run: >-
           python -m unittest
           test.test_comment_slop
+          test.test_debian_version
+          test.test_llamacpp_release_manifest
           test.test_llamacpp_release_assets
+          test.test_llamacpp_validation_evidence
+          test.test_publish_llamacpp_update
           test.test_validate_llamacpp_selection
           test.test_validate_llamacpp_workflow_plan
           -v
