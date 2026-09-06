@@ -210,6 +210,7 @@ class LlamaCppValidationPlanTests(unittest.TestCase):
         self.assertIn("test.test_llamacpp_capabilities", workflow)
         self.assertIn("test.test_llamacpp_validation_evidence", workflow)
         self.assertIn("test.test_validate_llamacpp_selection", workflow)
+        self.assertIn("test.test_verify_llamacpp_pin_manifest", workflow)
 
     def test_release_asset_manifest_is_captured_and_exported(self) -> None:
         validation = VALIDATION_WORKFLOW.read_text(encoding="utf-8")
@@ -229,9 +230,125 @@ class LlamaCppValidationPlanTests(unittest.TestCase):
         self.assertIn("llamacpp_release_manifest", asset_job)
         self.assertIn('--github-output "$GITHUB_OUTPUT"', asset_job)
         self.assertIn("jq -r '.assets[].name'", asset_job)
-        self.assertIn("repos/${repository}/commits/${tag}", asset_job)
-        self.assertIn("source_commit", asset_job)
+        self.assertIn("attach_release_claims", asset_job)
+        self.assertIn("--source-manifest-asset-id", asset_job)
+        self.assertIn("--validate-source-manifest", asset_job)
+        self.assertIn("Accept: application/octet-stream", asset_job)
+        self.assertIn("source_manifest_max_bytes=65536", asset_job)
+        self.assertIn("source_manifest_directory=$(mktemp -d)", asset_job)
+        self.assertIn(
+            'source_manifest_path="${source_manifest_directory}/source-'
+            '${source_manifest_asset_id}.json"',
+            asset_job,
+        )
+        self.assertIn('head -c "$((source_manifest_max_bytes + 1))"', asset_job)
+        self.assertIn('publisher_claim_type="immutable-source-manifest"', asset_job)
+        self.assertNotIn("--extract-source-commit", asset_job)
+        self.assertIn("--require-upstream-ancestry", asset_job)
+        self.assertIn("/compare/", asset_job)
+        self.assertRegex(
+            asset_job,
+            r"attach_release_claims lemonade-sdk/llamacpp-rocm "
+            r'\s*\\?\s*"\$ROCM_RELEASE" rocm_release\.json',
+        )
+        self.assertRegex(
+            asset_job,
+            r"attach_release_claims lemonade-sdk/llama\.cpp "
+            r'\s*\\?\s*"\$LEMONADE_RELEASE" lemonade_release\.json',
+        )
+        self.assertIn("source_repository=ggml-org/llama.cpp", asset_job)
+        self.assertIn("upstream_reference_head", asset_job)
+        self.assertIn("publisher_claimed_source_commit", asset_job)
+        self.assertIn("publisher_claim_type", asset_job)
+        self.assertIn("release_tag_commit", asset_job)
+        self.assertIn("source_repository", asset_job)
+        self.assertNotIn("attach_source_commit", asset_job)
+        self.assertNotIn(
+            'source_commit=$(gh api "repos/${repository}/commits/${tag}"',
+            asset_job,
+        )
         self.assertNotIn("release_asset_manifest", release_job)
+
+    def test_protected_pin_changes_require_live_committed_manifest(self) -> None:
+        validation = VALIDATION_WORKFLOW.read_text(encoding="utf-8")
+
+        self.assertIn("  verify-protected-release-manifest:\n", validation)
+        manifest_job = validation.split("  verify-protected-release-manifest:\n", 1)[
+            1
+        ].split("  build:\n", 1)[0]
+        build_job = validation.split("  build:\n", 1)[1].split("  validate:\n", 1)[0]
+        verifier = (
+            ROOT / ".github" / "scripts" / "verify_llamacpp_pin_manifest.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("pull_request_target", manifest_job)
+        self.assertIn("merge_group", manifest_job)
+        self.assertIn("base.sha", manifest_job)
+        self.assertIn("merge_group.base_sha", manifest_job)
+        self.assertIn("verify_llamacpp_pin_manifest.sh", manifest_job)
+        self.assertNotIn("id: managed-pin-changes", manifest_job)
+        self.assertNotIn("steps.managed-pin-changes.outputs.changed", manifest_job)
+        self.assertIn(".github/llamacpp_release_manifest.json", verifier)
+        self.assertIn("capture_llamacpp_release_manifest.sh", verifier)
+        self.assertIn("changed managed llama.cpp pins", verifier)
+        self.assertIn("verify-protected-release-manifest", build_job)
+        self.assertIn("  reverify-protected-release-manifest:\n", validation)
+        final_manifest_job = validation.split(
+            "  reverify-protected-release-manifest:\n", 1
+        )[1].split("  validation-gate:\n", 1)[0]
+        validation_gate = validation.split("  validation-gate:\n", 1)[1]
+        self.assertIn("needs: [validate", final_manifest_job)
+        self.assertIn("verify_llamacpp_pin_manifest.sh", final_manifest_job)
+        self.assertIn("reverify-protected-release-manifest", validation_gate)
+
+    def test_protected_sidecar_only_changes_fail_closed(self) -> None:
+        verifier = (
+            ROOT / ".github" / "scripts" / "verify_llamacpp_pin_manifest.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("manifest_path=.github/llamacpp_release_manifest.json", verifier)
+        self.assertIn(
+            'base_manifest_entry=$(git -C "$trusted_repository" ls-tree', verifier
+        )
+        self.assertIn(
+            'candidate_manifest_entry=$(git -C "$candidate_repository" ls-tree',
+            verifier,
+        )
+        self.assertIn("if [[ \"$changes\" == '{}' ]]", verifier)
+        self.assertIn(
+            '[[ "$base_manifest_entry" != "$candidate_manifest_entry" ]]', verifier
+        )
+        self.assertIn(
+            "Release manifest changes require changed managed llama.cpp pins.",
+            verifier,
+        )
+
+    def test_manifest_recheck_anchors_to_live_trusted_upstream(self) -> None:
+        capture = (
+            ROOT / ".github" / "scripts" / "capture_llamacpp_release_manifest.sh"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("trusted_source_repository=ggml-org/llama.cpp", capture)
+        self.assertIn(".default_branch", capture)
+        self.assertIn("live_upstream_head", capture)
+        self.assertIn("upstream-anchor-comparison", capture)
+        self.assertIn("--source-manifest-asset-id", capture)
+        self.assertIn("--validate-source-manifest", capture)
+        self.assertIn("Accept: application/octet-stream", capture)
+        self.assertIn("source_manifest_max_bytes=65536", capture)
+        self.assertIn("source_manifest_directory=$(mktemp -d)", capture)
+        self.assertIn(
+            'source_manifest_path="${source_manifest_directory}/source-'
+            '${source_manifest_asset_id}.json"',
+            capture,
+        )
+        self.assertIn('head -c "$((source_manifest_max_bytes + 1))"', capture)
+        self.assertIn('publisher_claim_type="immutable-source-manifest"', capture)
+        self.assertIn(
+            "${upstream_reference_head}...${live_upstream_head}",
+            capture,
+        )
+        self.assertIn("release_pattern='^b[0-9]+$'", capture)
 
     def test_pr_validation_uses_a_trusted_merge_check_gate(self) -> None:
         pull_request = PR_WORKFLOW.read_text(encoding="utf-8")
@@ -368,7 +485,9 @@ class LlamaCppValidationPlanTests(unittest.TestCase):
         self.assertIn("needs: validate-invocation", plan_job)
         self.assertIn("validate-invocation", build_job_header)
         self.assertIn(
-            "needs: [validate-invocation, build, validate, plan]", validation_gate
+            "needs: [validate-invocation, build, validate, "
+            "reverify-protected-release-manifest, plan]",
+            validation_gate,
         )
         self.assertNotIn("checks: write", validation_gate)
         self.assertNotIn("check-runs", validation_gate)
@@ -382,7 +501,7 @@ class LlamaCppValidationPlanTests(unittest.TestCase):
         )
         self.assertIn("github.event.pull_request.base.sha", validation)
         self.assertIn("github.event.pull_request.head.sha", validation)
-        self.assertEqual(validation.count("persist-credentials: false"), 4)
+        self.assertEqual(validation.count("persist-credentials: false"), 8)
 
     def test_authorization_removal_revokes_the_merge_check(self) -> None:
         pull_request = PR_WORKFLOW.read_text(encoding="utf-8")
@@ -541,7 +660,7 @@ class LlamaCppValidationPlanTests(unittest.TestCase):
         evidence_step = publication.split(
             "      - name: Validate complete validation evidence\n", 1
         )[1].split(
-            "      - name: Update backend_versions.json with verified releases\n", 1
+            "      - name: Update backend_versions.json from release manifest\n", 1
         )[
             0
         ]
@@ -559,9 +678,9 @@ class LlamaCppValidationPlanTests(unittest.TestCase):
             "needs.validate.outputs.release_asset_manifest",
             manifest_step,
         )
-        self.assertIn("gh api", manifest_step)
-        self.assertIn("repos/${repository}/commits/${tag}", manifest_step)
-        self.assertIn("source_commit", manifest_step)
+        self.assertIn("capture_llamacpp_release_manifest.sh", manifest_step)
+        self.assertIn("--materialize-manifest", manifest_step)
+        self.assertIn("EXPECTED_RELEASE_ASSET_MANIFEST", publication)
         self.assertNotIn("\n      - name:", manifest_step)
         self.assertLess(
             publication.index("      - name: Generate PR body\n"),

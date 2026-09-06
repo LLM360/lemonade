@@ -23,7 +23,8 @@ These are caller-supplied starting points. Lemonade does not install per-model s
 These model IDs must ship only with managed llama.cpp binaries built from accepted K2-Horizon
 support on current upstream llama.cpp. The catalog entries are staged while that upstream
 port, the coordinated backend pins, and packaged runtime validation are completed. Do not
-publish them with the current managed pins or substitute the obsolete IFM development branch.
+publish them with the current managed pins or substitute the IFM development branch for a
+managed release.
 
 After compatible managed binaries are pinned, start a model with a bounded context:
 
@@ -61,7 +62,7 @@ print(message.content)
 
 The upstream parser and packaged-runtime gate must prove high, medium, low, and disabled
 reasoning plus the `json`, `xml`, and `xml_typed` tool-call formats before publication. The
-obsolete IFM development branch does not pass that complete matrix: medium and low reasoning
+IFM development branch does not pass that complete matrix: medium and low reasoning
 can expose IFM control tags, and the non-default tool formats can cause parser errors. To
 disable thinking after the compatible managed release ships, set
 `chat_template_kwargs.enable_thinking` to `false`. Use a large output allowance for long

@@ -52,7 +52,7 @@ jobs:
           --directory .
           --expected-matrix-json "$EXPECTED_VALIDATION_MATRIX"
 
-      - name: Update backend_versions.json with verified releases
+      - name: Update backend_versions.json from release manifest
         shell: bash
         env:
           LLAMACPP_RELEASE: ${{ needs.validate.outputs.llamacpp_release }}
@@ -226,47 +226,22 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EXPECTED_RELEASE_ASSET_MANIFEST: ${{ needs.validate.outputs.release_asset_manifest }}
-          LLAMACPP_RELEASE: ${{ needs.validate.outputs.llamacpp_release }}
-          LLAMACPP_ROCM_RELEASE: ${{ needs.validate.outputs.llamacpp_rocm_release }}
-          LLAMACPP_LEMONADE_RELEASE: ${{ needs.validate.outputs.llamacpp_lemonade_release }}
         run: |
           set -euo pipefail
 
-          gh api "repos/ggml-org/llama.cpp/releases/tags/${LLAMACPP_RELEASE}" \
-            > publish_ggml_release.json
-          gh api "repos/lemonade-sdk/llamacpp-rocm/releases/tags/${LLAMACPP_ROCM_RELEASE}" \
-            > publish_rocm_release.json
-          gh api "repos/lemonade-sdk/llama.cpp/releases/tags/${LLAMACPP_LEMONADE_RELEASE}" \
-            > publish_lemonade_release.json
-
-          attach_source_commit() {
-            local repository="$1"
-            local tag="$2"
-            local path="$3"
-            local source_commit
-            source_commit=$(gh api "repos/${repository}/commits/${tag}" --jq '.sha')
-            if ! [[ "$source_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
-              echo "::error::Could not resolve ${repository} ${tag} to a commit."
-              exit 1
-            fi
-            jq --arg source_commit "$source_commit" \
-              '.source_commit = $source_commit' "$path" > "${path}.with-source"
-            mv "${path}.with-source" "$path"
-          }
-          attach_source_commit ggml-org/llama.cpp "$LLAMACPP_RELEASE" publish_ggml_release.json
-          attach_source_commit lemonade-sdk/llamacpp-rocm "$LLAMACPP_ROCM_RELEASE" publish_rocm_release.json
-          attach_source_commit lemonade-sdk/llama.cpp "$LLAMACPP_LEMONADE_RELEASE" publish_lemonade_release.json
-
+          snapshot_directory=$(mktemp -d)
+          expected_path="${snapshot_directory}/expected-input.json"
           python -m test.utils.llamacpp_release_manifest \
-            --release ggml-org/llama.cpp "$LLAMACPP_RELEASE" publish_ggml_release.json \
-            --release lemonade-sdk/llamacpp-rocm "$LLAMACPP_ROCM_RELEASE" publish_rocm_release.json \
-            --release lemonade-sdk/llama.cpp "$LLAMACPP_LEMONADE_RELEASE" publish_lemonade_release.json \
-            --expected-json "$EXPECTED_RELEASE_ASSET_MANIFEST"
+            --materialize-manifest "$expected_path" \
+            --manifest-json "$EXPECTED_RELEASE_ASSET_MANIFEST" >/dev/null
+          bash .github/scripts/capture_llamacpp_release_manifest.sh \
+            "$expected_path" "${snapshot_directory}/live" >/dev/null
 
       - name: Publish update pull request
         env:
           BASE_BRANCH: ${{ github.event.repository.default_branch }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EXPECTED_RELEASE_ASSET_MANIFEST: ${{ needs.validate.outputs.release_asset_manifest }}
           LLAMACPP_RELEASE: ${{ needs.validate.outputs.llamacpp_release }}
           LLAMACPP_ROCM_RELEASE: ${{ needs.validate.outputs.llamacpp_rocm_release }}
           LLAMACPP_LEMONADE_RELEASE: ${{ needs.validate.outputs.llamacpp_lemonade_release }}

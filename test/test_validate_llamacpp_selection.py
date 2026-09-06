@@ -424,7 +424,7 @@ class LlamaCppValidationRuntimeTests(unittest.TestCase):
     def request_json_for_chat(self, chat_message, operations=None):
         loaded = False
 
-        def request_json(method, url, timeout, **_kwargs):
+        def request_json(method, url, timeout, **kwargs):
             nonlocal loaded
             del method, timeout
             operation = url.rsplit("/", maxsplit=1)[-1]
@@ -450,7 +450,12 @@ class LlamaCppValidationRuntimeTests(unittest.TestCase):
                     )
                 }
             if operation == "completions":
-                return self.response(), {"choices": [{"message": chat_message}]}
+                message = (
+                    chat_message(kwargs["json"])
+                    if callable(chat_message)
+                    else chat_message
+                )
+                return self.response(), {"choices": [{"message": message}]}
             if operation == "stats":
                 return self.response(), {"output_tokens": 4}
             return self.response(), {}
@@ -604,6 +609,33 @@ class LlamaCppValidationRuntimeTests(unittest.TestCase):
 
         self.assertFalse(success)
         self.assertIn("visible final content", error)
+
+    def test_plain_smoke_disables_reasoning_to_get_visible_final_content(self) -> None:
+        def reasoning_model_response(payload):
+            self.assertEqual(payload["max_completion_tokens"], 50)
+            if payload.get("chat_template_kwargs") == {"enable_thinking": False}:
+                return {"content": "The answer is 4."}
+            return {
+                "content": "",
+                "reasoning_content": "The answer should be four.",
+            }
+
+        with (
+            mock.patch.object(
+                VALIDATION,
+                "request_json",
+                side_effect=self.request_json_for_chat(reasoning_model_response),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            success, response, _stats = VALIDATION.test_model(
+                "http://localhost:13305/api/v1",
+                "builtin.Test-Llama",
+                "vulkan",
+            )
+
+        self.assertTrue(success, response)
+        self.assertEqual(response, "The answer is 4.")
 
     def test_model_runs_requested_capability_profile_and_records_evidence(self) -> None:
         matrix = {

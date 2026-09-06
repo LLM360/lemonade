@@ -88,6 +88,7 @@ jobs:
           test.test_publish_llamacpp_update
           test.test_validate_llamacpp_selection
           test.test_validate_llamacpp_workflow_plan
+          test.test_verify_llamacpp_pin_manifest
           -v
       - name: Run PowerShell validation argument tests
         shell: pwsh

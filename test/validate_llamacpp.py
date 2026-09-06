@@ -310,6 +310,7 @@ def test_model(
                 "model": model_name,
                 "messages": CHAT_PROMPT,
                 "max_completion_tokens": max_tokens,
+                "chat_template_kwargs": {"enable_thinking": False},
             },
         )
         if chat_resp.status_code != 200:
