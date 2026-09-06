@@ -2,60 +2,30 @@
 
 Lemonade uses [llama.cpp](https://github.com/ggerganov/llama.cpp) as its primary LLM inference backend, supporting multiple hardware acceleration options. This document explains the available backends and how to choose between them.
 
-## K2-Horizon (IFM branch build)
+- [K2-Horizon](#k2-horizon)
+- [Available Backends](#available-backends)
+- [ROCm Channel Configuration](#rocm-channel-configuration)
+- [Choosing the Right Backend](#choosing-the-right-backend)
+- [Platform Specifics](#platform-specifics)
+
+## K2-Horizon
 
 Lemonade includes these official IFM BF16 GGUF models:
 
-| Model ID | Weight size | Maximum context | Suggested starting values |
+| Model ID | Weight Size | Maximum Context | Suggested Starting Values |
 | --- | ---: | ---: | --- |
 | `K2-Horizon-0.9B-GGUF` | 2.16 GB | 131,072 tokens | high reasoning effort, temperature 0.6, top-p 0.95 |
 | `K2-Horizon-3.7B-GGUF` | 10.13 GB | 524,288 tokens | high reasoning effort, temperature 1.0, top-p 0.95 |
 | `K2-Horizon-7B-GGUF` | 18.01 GB | 524,288 tokens | high reasoning effort, temperature 1.0, top-p 0.95 |
 
-These files need the K2-Horizon implementation from the
-[`MBZUAI-IFM/llama.cpp` `model/K2Horizon` branch](https://github.com/MBZUAI-IFM/llama.cpp/tree/model/K2Horizon).
-Use commit `35999d101cf2233fc54f09c3c8d599da7303ce02` for a reproducible build.
-The standard llama.cpp binaries that Lemonade currently downloads do not contain this
-implementation. Build the required server and configure Lemonade to use its executable:
+These are caller-supplied starting points. Lemonade does not install per-model sampling defaults.
 
-> Do not run these model IDs with Lemonade's current managed llama.cpp binaries. The
-> catalog changes are intended to ship only after branch-derived binaries are published
-> and pinned for every supported backend.
+These model IDs must ship only with managed llama.cpp binaries built from accepted K2-Horizon
+support on current upstream llama.cpp. The catalog entries are staged while that upstream
+port, the coordinated backend pins, and packaged runtime validation are completed. Do not
+publish them with the current managed pins or substitute the obsolete IFM development branch.
 
-```bash
-git clone --branch model/K2Horizon --single-branch \
-  https://github.com/MBZUAI-IFM/llama.cpp.git k2-horizon-llama.cpp
-git -C k2-horizon-llama.cpp checkout --detach \
-  35999d101cf2233fc54f09c3c8d599da7303ce02
-
-cmake -S k2-horizon-llama.cpp -B k2-horizon-llama.cpp/build \
-  -DCMAKE_BUILD_TYPE=Release \
-  -DLLAMA_BUILD_TESTS=OFF \
-  -DLLAMA_BUILD_EXAMPLES=OFF \
-  -DLLAMA_BUILD_APP=OFF \
-  -DLLAMA_BUILD_UI=OFF \
-  -DLLAMA_USE_PREBUILT_UI=OFF \
-  -DLLAMA_BUILD_TOOLS=ON \
-  -DLLAMA_BUILD_SERVER=ON
-cmake --build k2-horizon-llama.cpp/build --config Release \
-  --target llama-server -j 8
-```
-
-The command above enables Metal automatically on macOS. Add the applicable llama.cpp CMake
-option for another accelerator: `-DGGML_VULKAN=ON`, `-DGGML_CUDA=ON`, or
-`-DGGML_HIP=ON`.
-
-Set the `*_bin` value to the full absolute path of `llama-server`, not its directory. For
-example, use this command for macOS:
-
-```bash
-lemonade config set \
-  llamacpp.metal_bin=/absolute/path/to/k2-horizon-llama.cpp/build/bin/llama-server
-```
-
-Use `cpu_bin`, `vulkan_bin`, `cuda_bin`, or `rocm_bin` for the applicable backend. On
-Windows, include `llama-server.exe` in the path. You can then start a model with a bounded
-context:
+After compatible managed binaries are pinned, start a model with a bounded context:
 
 ```bash
 lemonade run K2-Horizon-0.9B-GGUF --ctx-size 8192
@@ -89,10 +59,11 @@ if reasoning:
 print(message.content)
 ```
 
-Use high reasoning effort and the default `xml` tool-call format with the pinned branch
-commit. Its llama.cpp response parser does not correctly handle the template's `medium`,
-`low`, `json`, or `xml_typed` modes. Medium and low reasoning can expose IFM control tags,
-and the non-default tool formats can cause parser errors. To disable thinking, set
+The upstream parser and packaged-runtime gate must prove high, medium, low, and disabled
+reasoning plus the `json`, `xml`, and `xml_typed` tool-call formats before publication. The
+obsolete IFM development branch does not pass that complete matrix: medium and low reasoning
+can expose IFM control tags, and the non-default tool formats can cause parser errors. To
+disable thinking after the compatible managed release ships, set
 `chat_template_kwargs.enable_thinking` to `false`. Use a large output allowance for long
 reasoning tasks. Do not use a 32K output allowance as a server-wide default.
 
@@ -139,7 +110,7 @@ support K2-Horizon Uno.
 - **Use Case**: NVIDIA GPU-optimized inference
 - **Performance**: Optimized for NVIDIA hardware, typically outperforms Vulkan on supported GPUs
 - **Source**: Per-architecture builds from [lemonade-sdk/llama.cpp](https://github.com/lemonade-sdk/llama.cpp)
-- **Binaries**: Compute-capability-specific builds (sm_75, sm_80, sm_86, sm_89, sm_90, sm_100, sm_120)
+- **Binaries**: Compute-capability-specific builds (sm_75, sm_80, sm_86, sm_89, sm_90, sm_100, sm_120, sm_121)
 - **Runtime**: Bundled CUDA runtime libraries (no system-wide CUDA toolkit installation required)
 - **Notes**: On Windows, .7z extraction requires the bsdtar bundled with Windows 11 22H2+. On Linux, the build is shipped as .tar.xz and extracts with the system `tar`.
 

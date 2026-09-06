@@ -4,9 +4,9 @@ Lemonade nightly backend perf regression runner.
 
 Uses `lemonade bench` against each tracked fork's prebuilt binary.
 The fork binary is downloaded, then routed into lemond via
-`lemonade config set llamacpp.<backend>_bin <dir>` (done by the workflow
+`lemonade config set llamacpp.<backend>_bin=<executable>` (done by the workflow
 before lemond starts). lemond then serves --backend <backend> from that
-binary instead of downloading its own. There is no LEMONADE_*_BIN env var.
+binary instead of downloading its own.
 
 Usage:
   python .github/scripts/validate_backend_bench.py --forks src/cpp/resources/benchmark_forks.json --output ci/results
@@ -15,7 +15,6 @@ Usage:
 """
 
 import argparse
-import hashlib
 import json
 import os
 import platform
@@ -161,7 +160,7 @@ def find_lemonade_bin() -> str:
 
 
 def get_models_from_registry(base_url: str) -> list[str]:
-    """Mirror validate_llamacpp.py:get_hot_llamacpp_models() — reads live registry."""
+    """Select hot llama.cpp models from the live registry."""
     try:
         req = urllib.request.Request(f"{base_url}/api/v1/models?show_all=true")
         with urllib.request.urlopen(req, timeout=30) as r:
@@ -210,7 +209,7 @@ def install_fork_binary(
     fork_id = fork["fork_id"]
     exe_name = fork["binary_exe_windows"] if IS_WINDOWS else fork["binary_exe_linux"]
     if not exe_name:
-        print(f"  [skip] No binary for this platform")
+        print("  [skip] No binary for this platform")
         return None
 
     # One slot per fork — overwrite on version change, no disk accumulation
@@ -304,9 +303,8 @@ def run_bench(
     # llamacpp exposes {system, cuda, vulkan, rocm, cpu} — "rocm-nightly" and
     # "rocm-gfx11" are NOT backend keys (nightly/stable are rocm *channels*), so
     # forks declare install_as to map to the real key. The fork binary itself is
-    # routed via `lemonade config set llamacpp.<key>_bin <dir>` (done by the
-    # workflow before lemond starts); there is no LEMONADE_*_BIN env var —
-    # lemond never reads one.
+    # routed via `lemonade config set llamacpp.<key>_bin=<executable>` by the
+    # workflow before lemond starts.
     bench_as = fork.get("install_as", backend)
 
     cmd = [
@@ -610,7 +608,7 @@ def main() -> int:
             print(f"[skip] {fork_id} requires {runner_os}, running on {current_os}")
             continue
 
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
         print(f"Fork: {fork_id}  ({fork['label']})")
         print(f"Repo: {fork['repo']}")
 
@@ -653,7 +651,7 @@ def main() -> int:
                     continue
             else:
                 print(
-                    f"  Skipping POST /install — fork provides its own prebuilt binary"
+                    "  Skipping POST /install — fork provides its own prebuilt binary"
                 )
 
         # Fetch model list from registry now that lemond is confirmed running
@@ -752,7 +750,7 @@ def main() -> int:
         )
         print(f"Regression : {rr_out}")
 
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print("SUMMARY")
     criticals = [a for a in all_alerts if a["severity"] == "CRITICAL"]
     warns = [a for a in all_alerts if a["severity"] == "WARN"]

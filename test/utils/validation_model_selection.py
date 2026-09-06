@@ -62,6 +62,10 @@ def select_llamacpp_models(
     models = list(catalog)
 
     if requested_model_ids:
+        if lite:
+            raise ModelSelectionError(
+                "Explicit models and lite mode are mutually exclusive"
+            )
         if builtin_model_resolver is None:
             raise ModelSelectionError(
                 "Explicit model selection requires a built-in model resolver"
@@ -80,13 +84,17 @@ def select_llamacpp_models(
                     "model catalog"
                 )
             model = dict(model)
-            model["id"] = requested_model_id
             model["load_id"] = canonical_model_id
             recipe = model.get("recipe")
             if recipe != "llamacpp":
                 raise ModelSelectionError(
                     f"Model '{requested_model_id}' uses recipe '{recipe}', "
                     "expected 'llamacpp'"
+                )
+            labels = model.get("labels")
+            if not isinstance(labels, list) or "chat" not in labels:
+                raise ModelSelectionError(
+                    f"Model '{requested_model_id}' does not support chat validation"
                 )
             _require_pullable_checkpoint(model)
             selected.append(model)
@@ -103,8 +111,5 @@ def select_llamacpp_models(
 
     if lite:
         selected = [min(selected, key=_model_size)]
-
-    for model in selected:
-        _require_pullable_checkpoint(model)
 
     return selected

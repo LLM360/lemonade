@@ -43,6 +43,35 @@ VALIDATION_CTX_SIZE = 4096
 CHAT_PROMPT = [
     {"role": "user", "content": "What is 2+2? Reply in one sentence."},
 ]
+IFM_CONTROL_PREFIXES = ("<ifm|", "</ifm|")
+
+
+def find_raw_ifm_control_marker(value, field):
+    """Return the first raw IFM marker and its response-field path."""
+    pending = [(field, value)]
+    while pending:
+        path, candidate = pending.pop()
+        if isinstance(candidate, str):
+            normalized = candidate.lower()
+            offsets = [
+                normalized.find(prefix)
+                for prefix in IFM_CONTROL_PREFIXES
+                if prefix in normalized
+            ]
+            if offsets:
+                start = min(offsets)
+                end = candidate.find(">", start)
+                if end < 0:
+                    end = min(start + 79, len(candidate) - 1)
+                return candidate[start : end + 1], path
+        elif isinstance(candidate, dict):
+            items = list(candidate.items())
+            for key, nested_value in reversed(items):
+                pending.append((f"{path}.{key}", nested_value))
+        elif isinstance(candidate, (list, tuple)):
+            for index in range(len(candidate) - 1, -1, -1):
+                pending.append((f"{path}[{index}]", candidate[index]))
+    return None
 
 
 def collect_server_logs(output_dir):
@@ -245,6 +274,16 @@ def test_model(base_url, model_name, backend, max_tokens=50):
             return False, f"HTTP {chat_resp.status_code}: {chat_body}", {}
 
         message = chat_body["choices"][0]["message"]
+        marker = find_raw_ifm_control_marker(message, "message")
+        if marker:
+            marker_text, marker_path = marker
+            return (
+                False,
+                f"Raw IFM control marker {marker_text!r} found in "
+                f"response field {marker_path}",
+                {},
+            )
+
         content = message.get("content") or ""
         reasoning = message.get("reasoning_content") or ""
         combined = content + reasoning
@@ -277,6 +316,53 @@ def test_model(base_url, model_name, backend, max_tokens=50):
             unload_model(base_url, model_name)
         except requests.RequestException as exc:
             print(f"  Warning: failed to unload {model_name}: {exc}", flush=True)
+
+
+def validate_model_lifecycle(
+    base_url,
+    model_name,
+    backend,
+    reload_after_unload=False,
+):
+    """Validate one model and optionally validate a second load after unload."""
+    result = test_model(base_url, model_name, backend)
+    if not reload_after_unload or not result[0]:
+        return result
+
+    try:
+        health_response, health_body = request_json(
+            "GET",
+            f"{base_url}/health",
+            timeout=TIMEOUT_DEFAULT,
+        )
+    except requests.RequestException as exc:
+        return False, f"Could not verify unload before reload: {exc}", result[2]
+
+    if health_response.status_code != 200:
+        return (
+            False,
+            f"Could not verify unload before reload: HTTP "
+            f"{health_response.status_code} - {health_body}",
+            result[2],
+        )
+
+    if not isinstance(health_body, dict):
+        return False, "Could not verify unload: invalid health response", result[2]
+    loaded_models = health_body.get("all_models_loaded")
+    if not isinstance(loaded_models, list) or not all(
+        isinstance(model, dict) and isinstance(model.get("model_name"), str)
+        for model in loaded_models
+    ):
+        return False, "Could not verify unload: invalid model inventory", result[2]
+
+    aliases = {model_name}
+    if model_name.startswith("builtin."):
+        aliases.add(model_name.removeprefix("builtin."))
+    if any(model["model_name"] in aliases for model in loaded_models):
+        return False, f"Model '{model_name}' is still loaded after unload", result[2]
+
+    print("  Reloading model after unload...", flush=True)
+    return test_model(base_url, model_name, backend)
 
 
 def main():
@@ -334,15 +420,6 @@ def main():
 
     require_running_server(base_url, args.port)
 
-    if args.channel:
-        set_rocm_channel(base_url, args.channel)
-
-    print("Unloading all models for clean state...", flush=True)
-    try:
-        unload_all_models(port=args.port)
-    except requests.RequestException as exc:
-        print(f"Warning: failed to unload pre-existing models: {exc}", flush=True)
-
     catalog = get_model_catalog(base_url) if not args.model else []
     try:
         selected_models = select_llamacpp_models(
@@ -356,6 +433,15 @@ def main():
     except ModelSelectionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr, flush=True)
         sys.exit(1)
+
+    if args.channel:
+        set_rocm_channel(base_url, args.channel)
+
+    print("Unloading all models for clean state...", flush=True)
+    try:
+        unload_all_models(port=args.port)
+    except requests.RequestException as exc:
+        print(f"Warning: failed to unload pre-existing models: {exc}", flush=True)
 
     selection_mode = "explicitly selected" if args.model else "hot"
     print(
@@ -382,8 +468,11 @@ def main():
         for model in selected_models:
             model_name = model["id"]
             print(f"\nTesting: {model_name}", flush=True)
-            success, response_text, stats = test_model(
-                base_url, model.get("load_id", model_name), args.backend
+            success, response_text, stats = validate_model_lifecycle(
+                base_url,
+                model.get("load_id", model_name),
+                args.backend,
+                reload_after_unload=bool(args.model),
             )
             result = {
                 "model": model_name,

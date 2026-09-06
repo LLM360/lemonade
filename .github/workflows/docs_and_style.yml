@@ -77,7 +77,16 @@ jobs:
           python-version: '3.x'
       - run: pip install pre-commit
       - name: Run focused Python unit tests
-        run: python -m unittest test.test_comment_slop test.test_validate_llamacpp_selection -v
+        run: >-
+          python -m unittest
+          test.test_comment_slop
+          test.test_llamacpp_release_assets
+          test.test_validate_llamacpp_selection
+          test.test_validate_llamacpp_workflow_plan
+          -v
+      - name: Run PowerShell validation argument tests
+        shell: pwsh
+        run: ./test/test_llamacpp_validation_args.ps1
 
       - name: Run pre-commit on the changed files
         # Scoped to what the change touches; running repo-wide would fail on drift that
