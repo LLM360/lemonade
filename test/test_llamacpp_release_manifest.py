@@ -14,6 +14,7 @@ def release_payload(tag: str, release_id: int, asset_seed: int) -> dict:
     return {
         "id": release_id,
         "tag_name": tag,
+        "source_commit": f"{release_id:040x}",
         "assets": [
             {
                 "name": "z-last.zip",
@@ -56,7 +57,7 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         parsed = json.loads(first)
-        self.assertEqual(parsed["schema_version"], 1)
+        self.assertEqual(parsed["schema_version"], 2)
         self.assertEqual(
             [release["repository"] for release in parsed["releases"]],
             ["ggml-org/llama.cpp", "lemonade-sdk/llamacpp-rocm"],
@@ -87,6 +88,7 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
     def test_release_and_asset_identity_fields_are_required(self) -> None:
         cases = (
             ("release id", lambda payload: payload.pop("id")),
+            ("source commit", lambda payload: payload.pop("source_commit")),
             ("asset name", lambda payload: payload["assets"][0].pop("name")),
             ("asset id", lambda payload: payload["assets"][0].pop("id")),
             ("asset size", lambda payload: payload["assets"][0].pop("size")),
@@ -103,6 +105,20 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     manifest.ReleaseManifestError,
                     expected_error,
+                ):
+                    manifest.build_release_asset_manifest(
+                        [("ggml-org/llama.cpp", "b1234", payload)]
+                    )
+
+    def test_source_commit_must_be_a_full_git_oid(self) -> None:
+        for source_commit in (None, "", "abc123", "g" * 40):
+            with self.subTest(source_commit=source_commit):
+                payload = copy.deepcopy(self.ggml)
+                payload["source_commit"] = source_commit
+
+                with self.assertRaisesRegex(
+                    manifest.ReleaseManifestError,
+                    "source commit",
                 ):
                     manifest.build_release_asset_manifest(
                         [("ggml-org/llama.cpp", "b1234", payload)]

@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable
 
 SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
+GIT_OID_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 
 
 class ReleaseManifestError(ValueError):
@@ -39,6 +40,11 @@ def _canonical_release(
             f"got {actual_tag!r}"
         )
     release_id = _positive_integer(payload.get("id"), f"{repository}: release id")
+    source_commit = payload.get("source_commit")
+    if not isinstance(source_commit, str) or not GIT_OID_RE.fullmatch(source_commit):
+        raise ReleaseManifestError(
+            f"{repository}: source commit must be a full 40-character Git OID"
+        )
     raw_assets = payload.get("assets")
     if not isinstance(raw_assets, list) or not raw_assets:
         raise ReleaseManifestError(f"{repository}: release assets must be nonempty")
@@ -90,6 +96,7 @@ def _canonical_release(
         "assets": assets,
         "release_id": release_id,
         "repository": repository,
+        "source_commit": source_commit.lower(),
         "tag_name": expected_tag,
     }
 
@@ -108,7 +115,7 @@ def build_release_asset_manifest(
         raise ReleaseManifestError("release manifest contains duplicate repositories")
     canonical_releases.sort(key=lambda release: release["repository"])
     return json.dumps(
-        {"releases": canonical_releases, "schema_version": 1},
+        {"releases": canonical_releases, "schema_version": 2},
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -121,8 +128,8 @@ def _canonicalize_manifest(manifest_json: str) -> str:
         raise ReleaseManifestError(
             f"release manifest is not valid JSON: {exc}"
         ) from exc
-    if not isinstance(document, dict) or document.get("schema_version") != 1:
-        raise ReleaseManifestError("release manifest schema_version must be 1")
+    if not isinstance(document, dict) or document.get("schema_version") != 2:
+        raise ReleaseManifestError("release manifest schema_version must be 2")
     releases = document.get("releases")
     if not isinstance(releases, list):
         raise ReleaseManifestError("release manifest releases must be an array")
@@ -131,7 +138,13 @@ def _canonicalize_manifest(manifest_json: str) -> str:
     for release in releases:
         if not isinstance(release, dict):
             raise ReleaseManifestError("release manifest entry must be an object")
-        expected_keys = {"assets", "release_id", "repository", "tag_name"}
+        expected_keys = {
+            "assets",
+            "release_id",
+            "repository",
+            "source_commit",
+            "tag_name",
+        }
         if set(release) != expected_keys:
             raise ReleaseManifestError("release manifest entry has unexpected fields")
         inputs.append(
@@ -141,6 +154,7 @@ def _canonicalize_manifest(manifest_json: str) -> str:
                 {
                     "assets": release["assets"],
                     "id": release["release_id"],
+                    "source_commit": release["source_commit"],
                     "tag_name": release["tag_name"],
                 },
             )

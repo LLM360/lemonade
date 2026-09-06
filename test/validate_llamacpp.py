@@ -14,7 +14,8 @@ This script:
    llama.cpp models or all models with recipe `llamacpp` and label `hot`
 2. Installs the requested llamacpp backend via `POST /api/v1/install`
 3. For each selected model, loads it with the requested backend, sends a
-   `chat/completions` request, queries `/api/v1/stats`, and unloads it
+   `chat/completions` request, optionally runs an API capability profile,
+   queries `/api/v1/stats`, and unloads it
 4. Outputs a JSON results file for CI consumption
 """
 
@@ -29,6 +30,12 @@ from urllib.parse import quote
 
 import requests
 
+from utils.llamacpp_capability_validation import (
+    K2_HORIZON_PROFILE,
+    find_raw_ifm_control_marker,
+    reject_duplicate_json_object,
+    validate_capabilities,
+)
 from utils.server_base import _auth_headers, unload_all_models, wait_for_server
 from utils.test_models import PORT, TIMEOUT_DEFAULT
 from utils.validation_model_selection import (
@@ -39,39 +46,10 @@ from utils.validation_model_selection import (
 
 TIMEOUT_HEALTH = 60
 TIMEOUT_INFERENCE = 1800  # 30 minutes; large models may need 60+ GB download
-VALIDATION_CTX_SIZE = 4096
+VALIDATION_CTX_SIZE = 8192
 CHAT_PROMPT = [
     {"role": "user", "content": "What is 2+2? Reply in one sentence."},
 ]
-IFM_CONTROL_PREFIXES = ("<ifm|", "</ifm|", "<|ifm|")
-
-
-def find_raw_ifm_control_marker(value, field):
-    """Return the first raw IFM marker and its response-field path."""
-    pending = [(field, value)]
-    while pending:
-        path, candidate = pending.pop()
-        if isinstance(candidate, str):
-            normalized = candidate.lower()
-            offsets = [
-                normalized.find(prefix)
-                for prefix in IFM_CONTROL_PREFIXES
-                if prefix in normalized
-            ]
-            if offsets:
-                start = min(offsets)
-                end = candidate.find(">", start)
-                if end < 0:
-                    end = min(start + 79, len(candidate) - 1)
-                return candidate[start : end + 1], path
-        elif isinstance(candidate, dict):
-            items = list(candidate.items())
-            for key, nested_value in reversed(items):
-                pending.append((f"{path}.{key}", nested_value))
-        elif isinstance(candidate, (list, tuple)):
-            for index in range(len(candidate) - 1, -1, -1):
-                pending.append((f"{path}[{index}]", candidate[index]))
-    return None
 
 
 def collect_server_logs(output_dir):
@@ -105,10 +83,26 @@ def request_json(method, url, timeout, **kwargs):
     body = {}
     if response.content:
         try:
-            body = response.json()
+            body = response.json(object_pairs_hook=reject_duplicate_json_object)
         except ValueError:
             body = {"raw_text": response.text}
     return response, body
+
+
+def request_stream(method, url, timeout, **kwargs):
+    """Perform a streaming HTTP request and return decoded response lines."""
+    auth_headers = _auth_headers()
+    headers = {**(kwargs.get("headers") or {}), **auth_headers}
+    request_kwargs = {**kwargs, "headers": headers, "stream": True}
+    response = requests.request(method, url, timeout=timeout, **request_kwargs)
+
+    def lines():
+        try:
+            yield from response.iter_lines(decode_unicode=True)
+        finally:
+            response.close()
+
+    return response, lines()
 
 
 def require_running_server(base_url, port):
@@ -216,7 +210,15 @@ def unload_model(base_url, model_name=None):
         )
 
 
-def test_model(base_url, model_name, backend, max_tokens=50):
+def test_model(
+    base_url,
+    model_name,
+    backend,
+    max_tokens=50,
+    *,
+    capability_profile="",
+    capability_evidence=None,
+):
     """Send a chat/completions request and return (success, response_text, stats)."""
     print(f"  Loading model: {model_name} (backend={backend})", flush=True)
     try:
@@ -242,22 +244,62 @@ def test_model(base_url, model_name, backend, max_tokens=50):
             f"{base_url}/health",
             timeout=TIMEOUT_DEFAULT,
         )
-        if health_resp.status_code == 200:
-            loaded = {
-                model["model_name"]: model
-                for model in health_body.get("all_models_loaded", [])
-            }
-            loaded_model = loaded.get(model_name, {})
-            if not loaded_model and model_name.startswith("builtin."):
-                loaded_model = loaded.get(model_name.removeprefix("builtin."), {})
-            recipe_options = loaded_model.get("recipe_options", {})
-            actual_backend = recipe_options.get("llamacpp_backend")
-            if actual_backend and actual_backend != backend:
-                return (
-                    False,
-                    f"Model loaded with backend '{actual_backend}' instead of '{backend}'",
-                    {},
-                )
+        if health_resp.status_code != 200:
+            return (
+                False,
+                f"Loaded-model health inventory returned HTTP "
+                f"{health_resp.status_code}: {health_body}",
+                {},
+            )
+        if not isinstance(health_body, dict):
+            return False, "Loaded-model health response is not an object", {}
+        if "all_models_loaded" not in health_body:
+            return (
+                False,
+                "Loaded-model health response is missing all_models_loaded",
+                {},
+            )
+        loaded_models = health_body["all_models_loaded"]
+        if not isinstance(loaded_models, list) or not all(
+            isinstance(model, dict) and isinstance(model.get("model_name"), str)
+            for model in loaded_models
+        ):
+            return (
+                False,
+                "Loaded-model health response has an invalid model inventory",
+                {},
+            )
+
+        aliases = {model_name}
+        if model_name.startswith("builtin."):
+            aliases.add(model_name.removeprefix("builtin."))
+        else:
+            aliases.add(f"builtin.{model_name}")
+        loaded_model = next(
+            (model for model in loaded_models if model["model_name"] in aliases),
+            None,
+        )
+        if loaded_model is None:
+            return (
+                False,
+                f"Model '{model_name}' is absent from the loaded inventory",
+                {},
+            )
+
+        if "recipe_options" not in loaded_model:
+            return False, f"Loaded model '{model_name}' is missing recipe_options", {}
+        recipe_options = loaded_model["recipe_options"]
+        if not isinstance(recipe_options, dict):
+            return False, f"Loaded model '{model_name}' has invalid recipe_options", {}
+        actual_backend = recipe_options.get("llamacpp_backend")
+        if not isinstance(actual_backend, str) or not actual_backend:
+            return False, f"Loaded model '{model_name}' is missing llamacpp_backend", {}
+        if actual_backend != backend:
+            return (
+                False,
+                f"Model loaded with backend '{actual_backend}' instead of '{backend}'",
+                {},
+            )
 
         print("  Sending chat/completions request...", flush=True)
         chat_resp, chat_body = request_json(
@@ -284,11 +326,26 @@ def test_model(base_url, model_name, backend, max_tokens=50):
                 {},
             )
 
-        content = message.get("content") or ""
-        reasoning = message.get("reasoning_content") or ""
-        combined = content + reasoning
-        if not combined:
-            return False, "Empty response (no content or reasoning_content)", {}
+        content = message.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return False, "Plain chat response has no visible final content", {}
+
+        if capability_profile:
+            if not isinstance(capability_evidence, dict):
+                return False, "Capability evidence output is required", {}
+            matrix, capabilities_passed, capability_summary = validate_capabilities(
+                capability_profile,
+                base_url=base_url,
+                model=model_name,
+                request_json=request_json,
+                request_stream=request_stream,
+                timeout=TIMEOUT_INFERENCE,
+            )
+            capability_evidence.clear()
+            capability_evidence.update(matrix)
+            if not capabilities_passed:
+                return False, f"Capability validation failed: {capability_summary}", {}
+            print(f"  Capabilities: {capability_summary}", flush=True)
 
         stats = {}
         stats_resp, stats_body = request_json(
@@ -305,8 +362,7 @@ def test_model(base_url, model_name, backend, max_tokens=50):
                 flush=True,
             )
 
-        response_text = content if content else f"[reasoning] {reasoning}"
-        return True, response_text, stats
+        return True, content, stats
     except (KeyError, IndexError, TypeError, ValueError) as exc:
         return False, f"Bad response format: {exc}", {}
     except requests.RequestException as exc:
@@ -323,9 +379,18 @@ def validate_model_lifecycle(
     model_name,
     backend,
     reload_after_unload=False,
+    *,
+    capability_profile="",
+    capability_evidence=None,
 ):
     """Validate one model and optionally validate a second load after unload."""
-    result = test_model(base_url, model_name, backend)
+    capability_args = {}
+    if capability_profile:
+        capability_args = {
+            "capability_profile": capability_profile,
+            "capability_evidence": capability_evidence,
+        }
+    result = test_model(base_url, model_name, backend, **capability_args)
     if not reload_after_unload or not result[0]:
         return result
 
@@ -358,6 +423,8 @@ def validate_model_lifecycle(
     aliases = {model_name}
     if model_name.startswith("builtin."):
         aliases.add(model_name.removeprefix("builtin."))
+    else:
+        aliases.add(f"builtin.{model_name}")
     if any(model["model_name"] in aliases for model in loaded_models):
         return False, f"Model '{model_name}' is still loaded after unload", result[2]
 
@@ -409,8 +476,33 @@ def main():
         default=None,
         help="Directory to collect server log files into (for CI artifact upload)",
     )
+    parser.add_argument(
+        "--capability-profile",
+        choices=[K2_HORIZON_PROFILE],
+        default="",
+        help="Optional API capability contract to validate",
+    )
+    parser.add_argument(
+        "--capability-model",
+        action="append",
+        default=[],
+        help="Selected validation model that must run the capability profile",
+    )
     add_model_selection_arguments(parser)
     args = parser.parse_args()
+
+    has_capability_profile = bool(args.capability_profile)
+    has_capability_models = bool(args.capability_model)
+    if has_capability_profile != has_capability_models:
+        parser.error(
+            "--capability-profile and --capability-model must be supplied together"
+        )
+
+    canonical_capability_models = [
+        model_id.removeprefix("builtin.") for model_id in args.capability_model
+    ]
+    if len(set(canonical_capability_models)) != len(canonical_capability_models):
+        parser.error("--capability-model values must be unique")
 
     # Label used for output filenames and artifact names
     label = f"{args.backend}-{args.channel}" if args.channel else args.backend
@@ -433,6 +525,24 @@ def main():
     except ModelSelectionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr, flush=True)
         sys.exit(1)
+
+    selected_model_ids = {
+        candidate.removeprefix("builtin.")
+        for model in selected_models
+        for candidate in (model["id"], model.get("load_id", model["id"]))
+    }
+    missing_capability_models = sorted(
+        set(canonical_capability_models) - selected_model_ids
+    )
+    if missing_capability_models:
+        print(
+            "ERROR: Capability models are absent from the selected validation set: "
+            + ", ".join(missing_capability_models),
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(1)
+    capability_model_ids = set(canonical_capability_models)
 
     if args.channel:
         set_rocm_channel(base_url, args.channel)
@@ -468,11 +578,19 @@ def main():
         for model in selected_models:
             model_name = model["id"]
             print(f"\nTesting: {model_name}", flush=True)
+            runs_capability_profile = (
+                model_name.removeprefix("builtin.") in capability_model_ids
+            )
+            capability_evidence = {} if runs_capability_profile else None
             success, response_text, stats = validate_model_lifecycle(
                 base_url,
                 model.get("load_id", model_name),
                 args.backend,
                 reload_after_unload=bool(args.model),
+                capability_profile=(
+                    args.capability_profile if runs_capability_profile else ""
+                ),
+                capability_evidence=capability_evidence,
             )
             result = {
                 "model": model_name,
@@ -483,6 +601,8 @@ def main():
                 "time_to_first_token": stats.get("time_to_first_token", "N/A"),
                 "tokens_per_second": stats.get("tokens_per_second", "N/A"),
             }
+            if runs_capability_profile:
+                result["capability_matrix"] = capability_evidence
             results.append(result)
             status = "PASS" if success else "FAIL"
             print(f"  Result: {status}", flush=True)

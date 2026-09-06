@@ -74,14 +74,18 @@ def load_hot_llamacpp_model_ids(path: Path = MODEL_REGISTRY) -> list[str]:
 
 
 def _row(
+    target: str,
     backend: str,
     channel: str,
     runner: list[str],
     models: list[str],
     lite: bool,
     expected_models: list[str] | None = None,
+    capability_profile: str = "",
+    capability_models: list[str] | None = None,
 ) -> dict[str, object]:
     row = {
+        "target": target,
         "backend": backend,
         "channel": channel,
         "runner": list(runner),
@@ -90,6 +94,9 @@ def _row(
     }
     if expected_models is not None:
         row["expected_models"] = list(expected_models)
+    if capability_profile:
+        row["capability_profile"] = capability_profile
+        row["capability_models"] = list(capability_models or [])
     return row
 
 
@@ -111,14 +118,35 @@ def create_validation_plan(
         return {
             "include": [
                 _row(
+                    "windows-vulkan",
                     "vulkan",
                     "",
                     LARGE_VULKAN_RUNNER,
                     [K2_SMALL, K2_MEDIUM, K2_LARGE],
                     False,
+                    capability_profile="k2-horizon-v1",
+                    capability_models=[K2_SMALL],
                 ),
-                _row("rocm", "stable", SMALL_ROCM_RUNNER, [K2_SMALL], False),
-                _row("rocm", "nightly", SMALL_ROCM_RUNNER, [K2_SMALL], False),
+                _row(
+                    "rocm-stable",
+                    "rocm",
+                    "stable",
+                    SMALL_ROCM_RUNNER,
+                    [K2_SMALL],
+                    False,
+                    capability_profile="k2-horizon-v1",
+                    capability_models=[K2_SMALL],
+                ),
+                _row(
+                    "rocm-nightly",
+                    "rocm",
+                    "nightly",
+                    SMALL_ROCM_RUNNER,
+                    [K2_SMALL],
+                    False,
+                    capability_profile="k2-horizon-v1",
+                    capability_models=[K2_SMALL],
+                ),
             ]
         }
 
@@ -127,24 +155,42 @@ def create_validation_plan(
     expected_models = (
         load_hot_llamacpp_model_ids() if event_name == "schedule" else None
     )
+    capability_profile = "k2-horizon-v1" if event_name == "schedule" else ""
+    capability_models = [K2_SMALL] if event_name == "schedule" else None
     return {
         "include": [
-            _row("vulkan", "", runner_vulkan, models, lite, expected_models),
             _row(
+                "windows-vulkan",
+                "vulkan",
+                "",
+                runner_vulkan,
+                models,
+                lite,
+                expected_models,
+                capability_profile,
+                capability_models,
+            ),
+            _row(
+                "rocm-stable",
                 "rocm",
                 "stable",
                 runner_rocm,
                 models,
                 lite,
                 expected_models,
+                capability_profile,
+                capability_models,
             ),
             _row(
+                "rocm-nightly",
                 "rocm",
                 "nightly",
                 runner_rocm,
                 models,
                 lite,
                 expected_models,
+                capability_profile,
+                capability_models,
             ),
         ]
     }

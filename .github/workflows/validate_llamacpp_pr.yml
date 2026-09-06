@@ -1,0 +1,382 @@
+name: Validate llama.cpp protected change
+
+on:
+  pull_request_target:
+    types: [synchronize, edited, labeled, unlabeled, closed]
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name == 'merge_group' && format('merge-group-{0}', github.event.merge_group.head_sha) || format('pr-{0}-{1}', github.event.pull_request.number, (github.event.action == 'synchronize' || github.event.action == 'closed' || (github.event.action == 'edited' && github.event.changes.base.ref.from) || ((github.event.action == 'labeled' || github.event.action == 'unlabeled') && github.event.label.name == 'ci:upgrades')) && 'validation' || github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'merge_group' || github.event.action == 'synchronize' || github.event.action == 'closed' || (github.event.action == 'edited' && github.event.changes.base.ref.from) || (github.event.action == 'unlabeled' && github.event.label.name == 'ci:upgrades') }}
+
+jobs:
+  authorize-invocation:
+    name: Authorize invocation
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      run_validation: ${{ steps.authorize.outputs.run_validation }}
+    steps:
+      - name: Verify trusted invocation
+        id: authorize
+        env:
+          ACTOR: ${{ github.actor }}
+          EVENT_ACTION: ${{ github.event.action || '' }}
+          EVENT_LABEL: ${{ github.event.label.name || '' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "merge_group" ]; then
+            echo "run_validation=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if [ "$EVENT_NAME" != "pull_request_target" ]; then
+            echo "::error::Unsupported invocation event: $EVENT_NAME"
+            exit 1
+          fi
+
+          if [ "$EVENT_ACTION" != "labeled" ] || [ "$EVENT_LABEL" != "ci:upgrades" ]; then
+            echo "run_validation=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          pull_request=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          current_state=$(jq -r '.state' <<<"$pull_request")
+          current_authorized=$(jq -r \
+            'any(.labels[]?; .name == "ci:upgrades")' <<<"$pull_request")
+          if [ "$current_state" != "open" ] || [ "$current_authorized" != "true" ]; then
+            echo "run_validation=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          permission=$(gh api \
+            "repos/${GITHUB_REPOSITORY}/collaborators/${ACTOR}/permission" \
+            --jq '.permission')
+          case "$permission" in
+            admin|maintain|write|push)
+              echo "run_validation=true" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::$ACTOR cannot authorize self-hosted validation."
+              exit 1
+              ;;
+          esac
+
+  revoke-check:
+    name: Revoke removed authorization
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.action == 'unlabeled' &&
+      github.event.label.name == 'ci:upgrades' &&
+      github.event.pull_request.state == 'open'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Revoke the authorized merge check
+        env:
+          CHECK_NAME: llama.cpp authorized validation v2
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_SHA: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          pull_request=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+          current_state=$(jq -r '.state' <<<"$pull_request")
+          current_authorized=$(jq -r \
+            'any(.labels[]?; .name == "ci:upgrades")' <<<"$pull_request")
+          if [ "$current_state" != "open" ] || [ "$current_authorized" = "true" ]; then
+            echo "Pull request is closed or authorization was restored; skipping revocation."
+            exit 0
+          fi
+
+          external_prefix="lemonade-llamacpp-pr-${PR_NUMBER}-"
+          external_id="${external_prefix}revoked-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          check_runs=$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -f check_name="$CHECK_NAME" \
+            -f filter=all \
+            -F per_page=100)
+          revoked_id=$(jq -r --arg external_id "$external_id" \
+            '[.check_runs[] | select(.external_id == $external_id) | .id] | last // empty' \
+            <<<"$check_runs")
+
+          if [ -z "$revoked_id" ]; then
+            response=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f head_sha="$MERGE_SHA" \
+              -f external_id="$external_id" \
+              -f status=completed \
+              -f conclusion=cancelled \
+              -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              -f "output[title]=$CHECK_NAME" \
+              -f "output[summary]=The ci:upgrades authorization label was removed.")
+            revoked_id=$(jq -r '.id // empty' <<<"$response")
+          fi
+          if ! [[ "$revoked_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Checks API returned an invalid revocation check-run ID."
+            exit 1
+          fi
+
+          prior_check_ids=$(jq -r \
+            --arg external_id "$external_id" \
+            --arg external_prefix "$external_prefix" \
+            '.check_runs[]
+             | select((.external_id // "") | startswith($external_prefix))
+             | select(.external_id != $external_id)
+             | .id' <<<"$check_runs")
+          while IFS= read -r prior_check_id; do
+            [ -n "$prior_check_id" ] || continue
+            if ! [[ "$prior_check_id" =~ ^[0-9]+$ ]]; then
+              echo "::error::Checks API returned an invalid prior check-run ID."
+              exit 1
+            fi
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/check-runs/${prior_check_id}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f status=completed \
+              -f conclusion=cancelled \
+              -f "output[title]=$CHECK_NAME" \
+              -f "output[summary]=The ci:upgrades authorization label was removed." >/dev/null
+          done <<<"$prior_check_ids"
+
+  start-check:
+    name: Start authorized merge check
+    needs: authorize-invocation
+    if: needs.authorize-invocation.outputs.run_validation == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+    outputs:
+      check_run_id: ${{ steps.create.outputs.check_run_id }}
+    steps:
+      - name: Mark validation in progress
+        id: create
+        env:
+          CHECK_NAME: llama.cpp authorized validation v2
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.merge_commit_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          TARGET_KEY: ${{ github.event_name == 'merge_group' && format('merge-group-{0}', github.event.merge_group.head_sha) || format('pr-{0}', github.event.pull_request.number) }}
+        run: |
+          set -euo pipefail
+          EXTERNAL_PREFIX="lemonade-llamacpp-${TARGET_KEY}-"
+          EXTERNAL_ID="${EXTERNAL_PREFIX}${RUN_ID}-${RUN_ATTEMPT}"
+          check_runs=$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -f check_name="$CHECK_NAME" \
+            -f filter=all \
+            -F per_page=100)
+          check_run_id=$(jq -r --arg external_id "$EXTERNAL_ID" \
+            '[.check_runs[] | select(.external_id == $external_id) | .id] | last // empty' \
+            <<<"$check_runs")
+
+          if [ -z "$check_run_id" ]; then
+            response=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f head_sha="$MERGE_SHA" \
+              -f external_id="$EXTERNAL_ID" \
+              -f status=in_progress \
+              -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+            check_run_id=$(jq -r '.id // empty' <<<"$response")
+          fi
+          if ! [[ "$check_run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Checks API returned an invalid check-run ID."
+            exit 1
+          fi
+
+          prior_check_ids=$(jq -r \
+            --arg external_id "$EXTERNAL_ID" \
+            --arg external_prefix "$EXTERNAL_PREFIX" \
+            '.check_runs[]
+             | select((.external_id // "") | startswith($external_prefix))
+             | select(.external_id != $external_id)
+             | .id' <<<"$check_runs")
+          while IFS= read -r prior_check_id; do
+            [ -n "$prior_check_id" ] || continue
+            if ! [[ "$prior_check_id" =~ ^[0-9]+$ ]]; then
+              echo "::error::Checks API returned an invalid prior check-run ID."
+              exit 1
+            fi
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/check-runs/${prior_check_id}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f status=completed \
+              -f conclusion=cancelled \
+              -f "output[title]=$CHECK_NAME" \
+              -f "output[summary]=Superseded by a newer authorized validation run." >/dev/null
+          done <<<"$prior_check_ids"
+
+          echo "check_run_id=$check_run_id" >> "$GITHUB_OUTPUT"
+
+  validate:
+    name: Run authorized validation
+    needs: [authorize-invocation, start-check]
+    if: >-
+      needs.authorize-invocation.outputs.run_validation == 'true' &&
+      needs.start-check.result == 'success'
+    permissions:
+      contents: read
+    uses: ./.github/workflows/validate_llamacpp_core.yml
+
+  report:
+    name: Report authorized validation check
+    needs: [authorize-invocation, start-check, validate]
+    if: >-
+      always() &&
+      (github.event_name == 'merge_group' ||
+      (github.event.action == 'labeled' &&
+      github.event.label.name == 'ci:upgrades'))
+    runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+      pull-requests: read
+    steps:
+      - name: Assess authorized validation
+        id: assess
+        env:
+          AUTHORIZATION_RESULT: ${{ needs.authorize-invocation.result }}
+          RUN_VALIDATION: ${{ needs.authorize-invocation.outputs.run_validation }}
+          START_CHECK_RESULT: ${{ needs.start-check.result }}
+          VALIDATION_RESULT: ${{ needs.validate.result }}
+        run: |
+          set -euo pipefail
+
+          conclusion=failure
+          passed=false
+          summary="Invocation authorization failed."
+          if [ "$AUTHORIZATION_RESULT" = "success" ] && [ "$RUN_VALIDATION" = "true" ]; then
+            if [ "$START_CHECK_RESULT" != "success" ]; then
+              summary="Could not start the authorized merge validation check."
+            elif [ "$VALIDATION_RESULT" = "success" ]; then
+              conclusion=success
+              passed=true
+              summary="All authorized llama.cpp validation jobs passed."
+            else
+              summary="Authorized validation result: $VALIDATION_RESULT."
+            fi
+          fi
+
+          {
+            echo "conclusion=$conclusion"
+            echo "passed=$passed"
+            echo "summary=$summary"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Report result on the authorized merge commit
+        if: >-
+          always() &&
+          (github.event_name == 'merge_group' ||
+          (github.event.action == 'labeled' &&
+          github.event.label.name == 'ci:upgrades'))
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || '' }}
+          CHECK_NAME: llama.cpp authorized validation v2
+          CHECK_RUN_ID: ${{ needs.start-check.outputs.check_run_id }}
+          CONCLUSION: ${{ steps.assess.outputs.conclusion || 'failure' }}
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha || '' }}
+          MERGE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          SUMMARY: ${{ steps.assess.outputs.summary || 'Validation assessment failed.' }}
+          TARGET_KEY: ${{ github.event_name == 'merge_group' && format('merge-group-{0}', github.event.merge_group.head_sha) || format('pr-{0}', github.event.pull_request.number) }}
+        run: |
+          set -euo pipefail
+          EXTERNAL_PREFIX="lemonade-llamacpp-${TARGET_KEY}-"
+          EXTERNAL_ID="${EXTERNAL_PREFIX}${RUN_ID}-${RUN_ATTEMPT}"
+          stale=false
+          if [ "$CONCLUSION" = "success" ] && [ "$EVENT_NAME" = "pull_request_target" ]; then
+            pull_request=$(gh api "repos/${GITHUB_REPOSITORY}/pulls/${PR_NUMBER}")
+            current_state=$(jq -r '.state' <<<"$pull_request")
+            current_base=$(jq -r '.base.sha' <<<"$pull_request")
+            current_head=$(jq -r '.head.sha' <<<"$pull_request")
+            current_merge=$(jq -r '.merge_commit_sha // empty' <<<"$pull_request")
+            current_authorized=$(jq -r \
+              'any(.labels[]?; .name == "ci:upgrades")' <<<"$pull_request")
+            if [ "$current_state" != "open" ] || \
+               [ "$current_authorized" != "true" ] || \
+               [ "$current_base" != "$BASE_SHA" ] || \
+               [ "$current_head" != "$HEAD_SHA" ] || \
+               [ "$current_merge" != "$MERGE_SHA" ]; then
+              stale=true
+              CONCLUSION=failure
+              SUMMARY="The pull request authorization or merge identity changed during validation."
+            fi
+          fi
+
+          if ! [[ "$CHECK_RUN_ID" =~ ^[0-9]+$ ]]; then
+            check_runs=$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f check_name="$CHECK_NAME" \
+              -f filter=all \
+              -F per_page=100)
+            CHECK_RUN_ID=$(jq -r --arg external_id "$EXTERNAL_ID" \
+              '[.check_runs[] | select(.external_id == $external_id) | .id] | last // empty' \
+              <<<"$check_runs")
+          fi
+
+          if [[ "$CHECK_RUN_ID" =~ ^[0-9]+$ ]]; then
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/check-runs/${CHECK_RUN_ID}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f status=completed \
+              -f conclusion="$CONCLUSION" \
+              -f "output[title]=$CHECK_NAME" \
+              -f "output[summary]=$SUMMARY" >/dev/null
+          else
+            gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f head_sha="$MERGE_SHA" \
+              -f external_id="$EXTERNAL_ID" \
+              -f status=completed \
+              -f conclusion="$CONCLUSION" \
+              -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              -f "output[title]=$CHECK_NAME" \
+              -f "output[summary]=$SUMMARY" >/dev/null
+          fi
+
+          if [ "$stale" = "true" ]; then
+            exit 1
+          fi
+
+      - name: Enforce result
+        if: steps.assess.outputs.passed != 'true'
+        run: |
+          echo "${{ steps.assess.outputs.summary || 'Validation assessment failed.' }}"
+          exit 1

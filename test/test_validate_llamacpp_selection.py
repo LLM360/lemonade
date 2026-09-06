@@ -15,6 +15,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from test.utils import llamacpp_capability_validation as capabilities
 from test.utils import validation_model_selection as selection
 
 MODEL_REGISTRY = (
@@ -52,6 +53,7 @@ def load_validation_module():
     stubs = {
         "requests": requests_module,
         "utils": utils_package,
+        "utils.llamacpp_capability_validation": capabilities,
         "utils.server_base": server_base_module,
         "utils.test_models": test_models_module,
         "utils.validation_model_selection": selection,
@@ -396,6 +398,29 @@ class LlamaCppValidationRuntimeTests(unittest.TestCase):
     def response(status_code=200):
         return types.SimpleNamespace(status_code=status_code)
 
+    def test_request_json_rejects_duplicate_response_members(self) -> None:
+        response_text = '{"model":"wrong","model":"right"}'
+        response = types.SimpleNamespace(
+            status_code=200,
+            content=response_text.encode("utf-8"),
+            text=response_text,
+            json=lambda **kwargs: json.loads(response_text, **kwargs),
+        )
+
+        with mock.patch.object(
+            VALIDATION.requests,
+            "request",
+            return_value=response,
+            create=True,
+        ):
+            _response, body = VALIDATION.request_json(
+                "GET",
+                "http://localhost:13305/api/v1/health",
+                timeout=1,
+            )
+
+        self.assertEqual(body, {"raw_text": response_text})
+
     def request_json_for_chat(self, chat_message, operations=None):
         loaded = False
 
@@ -557,6 +582,184 @@ class LlamaCppValidationRuntimeTests(unittest.TestCase):
         self.assertTrue(success)
         self.assertEqual(response_text, message["content"])
 
+    def test_plain_chat_requires_visible_final_content(self) -> None:
+        message = {
+            "content": "",
+            "reasoning_content": "The answer should be four.",
+        }
+
+        with (
+            mock.patch.object(
+                VALIDATION,
+                "request_json",
+                side_effect=self.request_json_for_chat(message),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            success, error, _stats = VALIDATION.test_model(
+                "http://localhost:13305/api/v1",
+                "builtin.Test-Llama",
+                "vulkan",
+            )
+
+        self.assertFalse(success)
+        self.assertIn("visible final content", error)
+
+    def test_model_runs_requested_capability_profile_and_records_evidence(self) -> None:
+        matrix = {
+            "profile": capabilities.K2_HORIZON_PROFILE,
+            "model": "builtin.Test-Llama",
+            "pass": True,
+            "cases": [],
+        }
+        evidence = {}
+
+        with (
+            mock.patch.object(
+                VALIDATION,
+                "request_json",
+                side_effect=self.request_json_for_chat({"content": "The answer is 4."}),
+            ) as request,
+            mock.patch.object(
+                VALIDATION,
+                "validate_capabilities",
+                return_value=(matrix, True, "12/12 capability cases passed"),
+            ) as validate,
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            success, _response, _stats = VALIDATION.test_model(
+                "http://localhost:13305/api/v1",
+                "builtin.Test-Llama",
+                "vulkan",
+                capability_profile=capabilities.K2_HORIZON_PROFILE,
+                capability_evidence=evidence,
+            )
+
+        self.assertTrue(success)
+        self.assertEqual(evidence, matrix)
+        validate.assert_called_once_with(
+            capabilities.K2_HORIZON_PROFILE,
+            base_url="http://localhost:13305/api/v1",
+            model="builtin.Test-Llama",
+            request_json=request,
+            request_stream=VALIDATION.request_stream,
+            timeout=VALIDATION.TIMEOUT_INFERENCE,
+        )
+
+    def test_capability_failure_fails_model_and_preserves_matrix(self) -> None:
+        matrix = {
+            "profile": capabilities.K2_HORIZON_PROFILE,
+            "model": "builtin.Test-Llama",
+            "pass": False,
+            "cases": [{"id": "openai_reasoning_low", "pass": False}],
+        }
+        evidence = {}
+
+        with (
+            mock.patch.object(
+                VALIDATION,
+                "request_json",
+                side_effect=self.request_json_for_chat({"content": "The answer is 4."}),
+            ),
+            mock.patch.object(
+                VALIDATION,
+                "validate_capabilities",
+                return_value=(matrix, False, "reasoning low failed"),
+            ),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            success, error, _stats = VALIDATION.test_model(
+                "http://localhost:13305/api/v1",
+                "builtin.Test-Llama",
+                "vulkan",
+                capability_profile=capabilities.K2_HORIZON_PROFILE,
+                capability_evidence=evidence,
+            )
+
+        self.assertFalse(success)
+        self.assertIn("reasoning low failed", error)
+        self.assertEqual(evidence, matrix)
+
+    def test_model_requires_health_to_confirm_the_requested_backend(self) -> None:
+        cases = (
+            (503, {}, "health inventory returned HTTP 503"),
+            (200, {}, "missing all_models_loaded"),
+            (200, {"all_models_loaded": "invalid"}, "invalid model inventory"),
+            (200, {"all_models_loaded": []}, "is absent from the loaded inventory"),
+            (
+                200,
+                {"all_models_loaded": [{"model_name": "builtin.Test-Llama"}]},
+                "missing recipe_options",
+            ),
+            (
+                200,
+                {
+                    "all_models_loaded": [
+                        {
+                            "model_name": "builtin.Test-Llama",
+                            "recipe_options": "invalid",
+                        }
+                    ]
+                },
+                "invalid recipe_options",
+            ),
+            (
+                200,
+                {
+                    "all_models_loaded": [
+                        {
+                            "model_name": "builtin.Test-Llama",
+                            "recipe_options": {},
+                        }
+                    ]
+                },
+                "missing llamacpp_backend",
+            ),
+            (
+                200,
+                {
+                    "all_models_loaded": [
+                        {
+                            "model_name": "builtin.Test-Llama",
+                            "recipe_options": {"llamacpp_backend": "cpu"},
+                        }
+                    ]
+                },
+                "backend 'cpu' instead of 'vulkan'",
+            ),
+        )
+
+        for status_code, health, expected_error in cases:
+            with self.subTest(health=health, status_code=status_code):
+
+                def request_json(method, url, timeout, **_kwargs):
+                    del method, timeout
+                    operation = url.rsplit("/", maxsplit=1)[-1]
+                    if operation == "load":
+                        return self.response(), {}
+                    if operation == "health":
+                        return self.response(status_code), health
+                    if operation == "unload":
+                        return self.response(), {}
+                    self.fail(f"Unexpected request after invalid health: {operation}")
+
+                with (
+                    mock.patch.object(
+                        VALIDATION,
+                        "request_json",
+                        side_effect=request_json,
+                    ),
+                    contextlib.redirect_stdout(io.StringIO()),
+                ):
+                    success, error, _stats = VALIDATION.test_model(
+                        "http://localhost:13305/api/v1",
+                        "builtin.Test-Llama",
+                        "vulkan",
+                    )
+
+                self.assertFalse(success)
+                self.assertIn(expected_error, error)
+
     def run_validation(self, explicit):
         operations = []
         model = {
@@ -664,6 +867,43 @@ class LlamaCppValidationRuntimeTests(unittest.TestCase):
                 self.assertRegex(error, "Could not verify unload")
                 test_model.assert_called_once()
 
+    def test_reload_smoke_does_not_repeat_the_capability_profile(self) -> None:
+        evidence = {}
+        health = {"all_models_loaded": []}
+
+        with (
+            mock.patch.object(
+                VALIDATION,
+                "test_model",
+                side_effect=[(True, "first", {}), (True, "second", {})],
+            ) as test_model,
+            mock.patch.object(
+                VALIDATION,
+                "request_json",
+                return_value=(self.response(), health),
+            ),
+        ):
+            result = VALIDATION.validate_model_lifecycle(
+                "http://localhost:13305/api/v1",
+                "builtin.Test-Llama",
+                "vulkan",
+                reload_after_unload=True,
+                capability_profile=capabilities.K2_HORIZON_PROFILE,
+                capability_evidence=evidence,
+            )
+
+        self.assertTrue(result[0])
+        self.assertEqual(test_model.call_count, 2)
+        first_call, second_call = test_model.call_args_list
+        self.assertEqual(
+            first_call.kwargs,
+            {
+                "capability_profile": capabilities.K2_HORIZON_PROFILE,
+                "capability_evidence": evidence,
+            },
+        )
+        self.assertEqual(second_call.kwargs, {})
+
 
 class LlamaCppValidationSideEffectTests(unittest.TestCase):
     def test_invalid_explicit_model_is_rejected_before_server_mutation(self) -> None:
@@ -691,6 +931,145 @@ class LlamaCppValidationSideEffectTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, 1)
         set_channel.assert_not_called()
         unload_models.assert_not_called()
+
+    def test_capability_options_must_be_paired(self) -> None:
+        cases = (
+            ["--capability-profile", capabilities.K2_HORIZON_PROFILE],
+            ["--capability-model", "Test-Llama"],
+        )
+
+        for extra_args in cases:
+            with self.subTest(extra_args=extra_args):
+                argv = [
+                    "validate_llamacpp.py",
+                    "--backend",
+                    "rocm",
+                    "--channel",
+                    "nightly",
+                    *extra_args,
+                ]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(VALIDATION, "require_running_server"),
+                    mock.patch.object(VALIDATION, "set_rocm_channel") as set_channel,
+                    mock.patch.object(VALIDATION, "unload_all_models") as unload_models,
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    VALIDATION.main()
+
+                set_channel.assert_not_called()
+                unload_models.assert_not_called()
+
+    def test_capability_profile_can_target_a_selected_hot_model(self) -> None:
+        model = {
+            "id": "K2-Horizon-0.9B-GGUF",
+            "recipe": "llamacpp",
+            "labels": ["chat", "hot"],
+            "checkpoint": "IFM/example:model.gguf",
+        }
+        matrix = {
+            "profile": capabilities.K2_HORIZON_PROFILE,
+            "model": "K2-Horizon-0.9B-GGUF",
+            "pass": True,
+            "cases": [],
+        }
+
+        def validate_lifecycle(
+            _base_url,
+            _model_name,
+            _backend,
+            reload_after_unload=False,
+            *,
+            capability_profile="",
+            capability_evidence=None,
+        ):
+            self.assertFalse(reload_after_unload)
+            self.assertEqual(capability_profile, capabilities.K2_HORIZON_PROFILE)
+            capability_evidence.update(matrix)
+            return True, "Four.", {}
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            output_path = Path(temp_dir) / "results.json"
+            argv = [
+                "validate_llamacpp.py",
+                "--backend",
+                "vulkan",
+                "--skip-install",
+                "--capability-profile",
+                capabilities.K2_HORIZON_PROFILE,
+                "--capability-model",
+                model["id"],
+                "--output",
+                str(output_path),
+            ]
+            with (
+                mock.patch.object(sys, "argv", argv),
+                mock.patch.object(VALIDATION, "require_running_server"),
+                mock.patch.object(
+                    VALIDATION, "get_model_catalog", return_value=[model]
+                ),
+                mock.patch.object(VALIDATION, "unload_all_models"),
+                mock.patch.object(
+                    VALIDATION,
+                    "validate_model_lifecycle",
+                    side_effect=validate_lifecycle,
+                ) as lifecycle,
+                contextlib.redirect_stdout(io.StringIO()),
+            ):
+                VALIDATION.main()
+
+            records = json.loads(output_path.read_text(encoding="utf-8"))
+
+        lifecycle.assert_called_once()
+        self.assertEqual(records[0]["capability_matrix"], matrix)
+
+    def test_capability_model_must_be_selected_and_unique(self) -> None:
+        cases = (
+            ["--capability-model", "Other-Llama"],
+            [
+                "--capability-model",
+                "Test-Llama",
+                "--capability-model",
+                "Test-Llama",
+            ],
+        )
+        model = {
+            "id": "Test-Llama",
+            "recipe": "llamacpp",
+            "labels": ["chat"],
+            "checkpoint": "example/Test-Llama:model.gguf",
+        }
+
+        for capability_args in cases:
+            with self.subTest(capability_args=capability_args):
+                argv = [
+                    "validate_llamacpp.py",
+                    "--backend",
+                    "vulkan",
+                    "--model",
+                    "Test-Llama",
+                    "--capability-profile",
+                    capabilities.K2_HORIZON_PROFILE,
+                    *capability_args,
+                ]
+                with (
+                    mock.patch.object(sys, "argv", argv),
+                    mock.patch.object(VALIDATION, "require_running_server"),
+                    mock.patch.object(
+                        VALIDATION,
+                        "get_builtin_model",
+                        return_value=model,
+                    ),
+                    mock.patch.object(VALIDATION, "install_backend") as install,
+                    mock.patch.object(VALIDATION, "unload_all_models") as unload_models,
+                    contextlib.redirect_stderr(io.StringIO()),
+                    self.assertRaises(SystemExit),
+                ):
+                    VALIDATION.main()
+
+                install.assert_not_called()
+                unload_models.assert_not_called()
 
 
 if __name__ == "__main__":
