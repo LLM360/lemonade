@@ -513,8 +513,9 @@ int main() {
             }
 
             if (!truncated.empty()) {
+                const std::size_t advertised_length = truncated.size() + 128;
                 response.set_content_provider(
-                    truncated.size() + 128,
+                    advertised_length,
                     "text/event-stream",
                     [truncated = std::move(truncated)](
                         size_t offset, size_t, httplib::DataSink& sink) {
