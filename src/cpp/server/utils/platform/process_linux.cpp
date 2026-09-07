@@ -26,6 +26,10 @@
 #include <sys/capability.h>
 #endif
 
+#ifdef LEMONADE_PROCESS_TEST_HOOK
+extern "C" void lemonade_test_run_command_pipe_created(int fd);
+#endif
+
 namespace lemon::utils {
 
 // Helper functions
@@ -52,6 +56,95 @@ static void log_process_line(const std::string& line) {
         LOG(ERROR, "Process") << line << std::endl;
     } else {
         LOG(INFO, "Process") << line << std::endl;
+    }
+}
+
+static void close_pipe(int pipe_fds[2]) {
+    for (int i = 0; i < 2; ++i) {
+        if (pipe_fds[i] >= 0) {
+            close(pipe_fds[i]);
+            pipe_fds[i] = -1;
+        }
+    }
+}
+
+static bool create_pipe_above_standard_streams(int pipe_fds[2]) {
+    int pipe_result;
+    do {
+        pipe_result = pipe2(pipe_fds, O_CLOEXEC);
+    } while (pipe_result < 0 && errno == EINTR);
+    if (pipe_result < 0) {
+        return false;
+    }
+
+    for (int i = 0; i < 2; ++i) {
+        if (pipe_fds[i] > STDERR_FILENO) {
+            continue;
+        }
+
+        int replacement;
+        do {
+            replacement =
+                fcntl(pipe_fds[i], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
+        } while (replacement < 0 && errno == EINTR);
+        if (replacement < 0) {
+            close_pipe(pipe_fds);
+            return false;
+        }
+        close(pipe_fds[i]);
+        pipe_fds[i] = replacement;
+    }
+    return true;
+}
+
+static void read_process_output(
+    int fd,
+    bool log_output,
+    const std::shared_ptr<ProcessOutputCapture>& output_capture) {
+    char buffer[4096];
+    std::string line_buffer;
+    ssize_t bytes_read;
+
+    while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
+        if (output_capture) {
+            output_capture->append(buffer, static_cast<std::size_t>(bytes_read));
+        }
+        if (!log_output) {
+            continue;
+        }
+
+        line_buffer.append(buffer, static_cast<std::size_t>(bytes_read));
+        size_t pos;
+        while ((pos = line_buffer.find('\n')) != std::string::npos) {
+            std::string line = line_buffer.substr(0, pos);
+            line_buffer.erase(0, pos + 1);
+            log_process_line(line);
+        }
+    }
+
+    if (log_output && !line_buffer.empty()) {
+        log_process_line(line_buffer);
+    }
+    close(fd);
+    if (output_capture) {
+        output_capture->finish_reader();
+    }
+}
+
+static void start_process_output_reader(
+    int fd,
+    bool log_output,
+    const std::shared_ptr<ProcessOutputCapture>& output_capture) {
+    try {
+        std::thread(read_process_output, fd, log_output, output_capture).detach();
+    } catch (const std::exception& error) {
+        close(fd);
+        if (output_capture) {
+            output_capture->finish_reader();
+        }
+        LOG(ERROR, "ProcessManager")
+            << "Failed to start process output reader: " << error.what()
+            << std::endl;
     }
 }
 
@@ -101,7 +194,8 @@ public:
         const std::string& working_dir,
         bool inherit_output,
         bool filter_health_logs,
-        const std::vector<std::pair<std::string, std::string>>& env_vars) override;
+        const std::vector<std::pair<std::string, std::string>>& env_vars,
+        std::shared_ptr<ProcessOutputCapture> output_capture) override;
 
     void terminate(ProcessHandle handle) override;
     bool is_running(ProcessHandle handle) override;
@@ -129,7 +223,7 @@ protected:
         const std::vector<std::string>& args,
         const std::string& working_dir,
         bool inherit_output,
-        bool filter_health_logs,
+        bool redirect_output,
         const std::vector<std::pair<std::string, std::string>>& env_vars,
         int stdout_pipe[2],
         int stderr_pipe[2]);
@@ -141,7 +235,7 @@ pid_t LinuxProcessPlatform::spawn_process(
     const std::vector<std::string>& args,
     const std::string& working_dir,
     bool inherit_output,
-    bool filter_health_logs,
+    bool redirect_output,
     const std::vector<std::pair<std::string, std::string>>& env_vars,
     int stdout_pipe[2],
     int stderr_pipe[2]) {
@@ -165,8 +259,7 @@ pid_t LinuxProcessPlatform::spawn_process(
             setenv(env_pair.first.c_str(), env_pair.second.c_str(), 1);
         }
 
-        // Redirect stdout/stderr to pipes if filtering
-        if (inherit_output && filter_health_logs) {
+        if (redirect_output) {
             close(stdout_pipe[0]);
             close(stderr_pipe[0]);
             dup2(stdout_pipe[1], STDOUT_FILENO);
@@ -210,18 +303,25 @@ ProcessHandle LinuxProcessPlatform::spawn(
     const std::string& working_dir,
     bool inherit_output,
     bool filter_health_logs,
-    const std::vector<std::pair<std::string, std::string>>& env_vars) {
+    const std::vector<std::pair<std::string, std::string>>& env_vars,
+    std::shared_ptr<ProcessOutputCapture> output_capture) {
 
     ProcessHandle handle;
     handle.handle = nullptr;
     handle.pid = 0;
+    handle.output_capture = output_capture;
 
     int stdout_pipe[2] = {-1, -1};
     int stderr_pipe[2] = {-1, -1};
+    const bool redirect_output =
+        (inherit_output && filter_health_logs) || output_capture != nullptr;
 
-    // Create pipes for filtering if requested
-    if (inherit_output && filter_health_logs) {
-        if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
+    if (redirect_output) {
+        if (!create_pipe_above_standard_streams(stdout_pipe)) {
+            throw std::runtime_error("Failed to create pipes for output filtering");
+        }
+        if (!create_pipe_above_standard_streams(stderr_pipe)) {
+            close_pipe(stdout_pipe);
             throw std::runtime_error("Failed to create pipes for output filtering");
         }
     }
@@ -238,8 +338,17 @@ ProcessHandle LinuxProcessPlatform::spawn(
         }
     }
 
-    pid_t pid = spawn_process(executable, args, working_dir, inherit_output,
-                              filter_health_logs, env_vars, stdout_pipe, stderr_pipe);
+    pid_t pid;
+    try {
+        pid = spawn_process(executable, args, working_dir, inherit_output,
+                            redirect_output, env_vars, stdout_pipe, stderr_pipe);
+    } catch (...) {
+        if (redirect_output) {
+            close_pipe(stdout_pipe);
+            close_pipe(stderr_pipe);
+        }
+        throw;
+    }
 
     handle.pid = pid;
 
@@ -247,58 +356,14 @@ ProcessHandle LinuxProcessPlatform::spawn(
         LOG(INFO, "ProcessManager") << "Process started successfully, PID: " << pid << std::endl;
     }
 
-    // Start filter threads if needed
-    if (inherit_output && filter_health_logs) {
+    if (redirect_output) {
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        std::thread([fd = stdout_pipe[0]]() {
-            char buffer[4096];
-            std::string line_buffer;
-            ssize_t bytes_read;
-
-            while ((bytes_read = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
-                buffer[bytes_read] = '\0';
-                line_buffer += buffer;
-
-                size_t pos;
-                while ((pos = line_buffer.find('\n')) != std::string::npos) {
-                    std::string line = line_buffer.substr(0, pos);
-                    line_buffer = line_buffer.substr(pos + 1);
-                    log_process_line(line);
-                }
-            }
-
-            if (!line_buffer.empty()) {
-                log_process_line(line_buffer);
-            }
-
-            close(fd);
-        }).detach();
-
-        std::thread([fd = stderr_pipe[0]]() {
-            char buffer[4096];
-            std::string line_buffer;
-            ssize_t bytes_read;
-
-            while ((bytes_read = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
-                buffer[bytes_read] = '\0';
-                line_buffer += buffer;
-
-                size_t pos;
-                while ((pos = line_buffer.find('\n')) != std::string::npos) {
-                    std::string line = line_buffer.substr(0, pos);
-                    line_buffer = line_buffer.substr(pos + 1);
-                    log_process_line(line);
-                }
-            }
-
-            if (!line_buffer.empty()) {
-                log_process_line(line_buffer);
-            }
-
-            close(fd);
-        }).detach();
+        start_process_output_reader(stdout_pipe[0], inherit_output,
+                                    output_capture);
+        start_process_output_reader(stderr_pipe[0], inherit_output,
+                                    output_capture);
     }
 
     return handle;
@@ -500,17 +565,16 @@ int LinuxProcessPlatform::run_with_output(
     int timeout_seconds,
     bool capture_stderr) {
 
-    int stdout_pipe[2];
+    int stdout_pipe[2] = {-1, -1};
 
-    if (pipe(stdout_pipe) < 0) {
+    if (!create_pipe_above_standard_streams(stdout_pipe)) {
         throw std::runtime_error("Failed to create pipe");
     }
 
     pid_t pid = fork();
 
     if (pid < 0) {
-        close(stdout_pipe[0]);
-        close(stdout_pipe[1]);
+        close_pipe(stdout_pipe);
         throw std::runtime_error("Failed to fork process");
     }
 
@@ -676,10 +740,13 @@ int LinuxProcessPlatform::find_free_port(int start_port) {
 int LinuxProcessPlatform::run_command(const std::string& command, std::string& output, int timeout_seconds) {
     output.clear();
 
-    FILE* pipe = popen(command.c_str(), "r");
+    FILE* pipe = popen(command.c_str(), "re");
     if (!pipe) {
         return -1;
     }
+#ifdef LEMONADE_PROCESS_TEST_HOOK
+    lemonade_test_run_command_pipe_created(fileno(pipe));
+#endif
 
     char buf[4096];
     while (fgets(buf, sizeof(buf), pipe)) {

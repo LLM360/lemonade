@@ -7,46 +7,26 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from test.utils import llamacpp_capability_validation as capabilities
 from test.utils import llamacpp_validation_evidence as evidence
+from test.utils import llamacpp_validation_plan as planning
 
 K2_SMALL = "K2-Horizon-0.9B-GGUF"
 
 
-def expected_matrix(models: list[str] | None = None) -> dict:
-    planned_models = models or [K2_SMALL]
-    return {
-        "include": [
-            {
-                "target": "windows-vulkan",
-                "backend": "vulkan",
-                "channel": "",
-                "models": [],
-                "expected_models": planned_models,
-                "capability_profile": capabilities.K2_HORIZON_PROFILE,
-                "capability_models": [K2_SMALL],
-            },
-            {
-                "target": "rocm-stable",
-                "backend": "rocm",
-                "channel": "stable",
-                "models": [],
-                "expected_models": planned_models,
-                "capability_profile": capabilities.K2_HORIZON_PROFILE,
-                "capability_models": [K2_SMALL],
-            },
-            {
-                "target": "rocm-nightly",
-                "backend": "rocm",
-                "channel": "nightly",
-                "models": [],
-                "expected_models": planned_models,
-                "capability_profile": capabilities.K2_HORIZON_PROFILE,
-                "capability_models": [K2_SMALL],
-            },
-        ]
-    }
+def expected_matrix(
+    models_by_target: dict[str, list[str]] | None = None,
+) -> dict:
+    matrix = planning.create_validation_plan("schedule")
+    for row in matrix["include"]:
+        if models_by_target is None or row["target"] not in models_by_target:
+            continue
+        planned_models = models_by_target[row["target"]]
+        row["models"] = list(planned_models)
+        row["expected_models"] = list(planned_models)
+    return matrix
 
 
 def passing_capability_matrix(model: str = K2_SMALL) -> dict:
@@ -69,9 +49,10 @@ def passing_capability_matrix(model: str = K2_SMALL) -> dict:
             "openai_tool_default_xml",
             "openai_tool_stream_xml",
         }
-        reasoning_case = case_id.startswith("openai_reasoning_") or case_id == (
-            "ollama_thinking"
-        )
+        reasoning_case = (
+            case_id.startswith("openai_reasoning_")
+            and case_id != "openai_reasoning_low"
+        ) or case_id == "ollama_thinking"
         content_case = case_id in {
             "openai_plain_off_nonstream",
             "openai_plain_off_stream",
@@ -133,10 +114,22 @@ def passing_result(model: str = K2_SMALL, *, capability: bool | None = None) -> 
 
 
 class LlamaCppValidationEvidenceTests(unittest.TestCase):
-    def write_expected_results(self, root: Path) -> None:
-        for filename in evidence.EXPECTED_RESULT_FILES:
+    def write_expected_results(self, root: Path, matrix: dict | None = None) -> None:
+        selected_matrix = matrix or expected_matrix()
+        for row in selected_matrix["include"]:
+            filename = f"llamacpp_validation_{row['target']}.json"
+            records = [
+                passing_result(model, capability=model == K2_SMALL)
+                for model in row["expected_models"]
+            ]
             (root / filename).write_text(
-                json.dumps([passing_result()]),
+                json.dumps(records),
+                encoding="utf-8",
+            )
+            restart_filename = f"llamacpp_restart_validation_{row['target']}.json"
+            restart_model = row["capability_models"][0]
+            (root / restart_filename).write_text(
+                json.dumps([passing_result(restart_model, capability=False)]),
                 encoding="utf-8",
             )
 
@@ -147,8 +140,22 @@ class LlamaCppValidationEvidenceTests(unittest.TestCase):
 
             results = evidence.load_and_validate_results(root, expected_matrix())
 
-        self.assertEqual(set(results), set(evidence.EXPECTED_RESULT_FILES))
-        self.assertTrue(all(len(records) == 1 for records in results.values()))
+        self.assertEqual(
+            set(results),
+            set(evidence.EXPECTED_RESULT_FILES)
+            | set(evidence.EXPECTED_RESTART_RESULT_FILES),
+        )
+        self.assertGreater(
+            len(results["llamacpp_validation_windows-vulkan.json"]),
+            1,
+        )
+        self.assertTrue(
+            all(
+                len(records) == 1
+                for filename, records in results.items()
+                if filename != "llamacpp_validation_windows-vulkan.json"
+            )
+        )
 
     def test_missing_empty_and_invalid_json_files_fail_closed(self) -> None:
         cases = {
@@ -162,6 +169,38 @@ class LlamaCppValidationEvidenceTests(unittest.TestCase):
                 root = Path(directory)
                 self.write_expected_results(root)
                 target = root / evidence.EXPECTED_RESULT_FILES[0]
+                if replacement is None:
+                    target.unlink()
+                else:
+                    target.write_text(replacement, encoding="utf-8")
+
+                with self.assertRaises(evidence.ValidationEvidenceError):
+                    evidence.load_and_validate_results(root, expected_matrix())
+
+    def test_restart_evidence_must_be_present_exact_and_passing(self) -> None:
+        mutations = {
+            "missing": None,
+            "empty": "",
+            "invalid": "not json",
+            "empty list": "[]",
+            "failed": json.dumps([{**passing_result(capability=False), "pass": False}]),
+            "wrong model": json.dumps(
+                [passing_result("Other-Llama", capability=False)]
+            ),
+            "extra model": json.dumps(
+                [
+                    passing_result(capability=False),
+                    passing_result("Other-Llama", capability=False),
+                ]
+            ),
+            "unexpected capabilities": json.dumps([passing_result()]),
+        }
+        target_name = "llamacpp_restart_validation_linux-vulkan.json"
+        for name, replacement in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_expected_results(root)
+                target = root / target_name
                 if replacement is None:
                     target.unlink()
                 else:
@@ -199,11 +238,120 @@ class LlamaCppValidationEvidenceTests(unittest.TestCase):
                 with self.assertRaises(evidence.ValidationEvidenceError):
                     evidence.load_and_validate_results(root, expected_matrix())
 
+    def test_exact_producer_record_schema_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            expected = passing_result()
+            path.write_text(json.dumps([expected]), encoding="utf-8")
+
+            records = evidence.load_and_validate_result_file(
+                path,
+                [K2_SMALL],
+                capability_profile=capabilities.K2_HORIZON_PROFILE,
+                capability_models=[K2_SMALL],
+            )
+
+        self.assertEqual(records, [expected])
+
+    def test_result_file_above_byte_limit_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            path.write_text(
+                json.dumps([passing_result(capability=False)]),
+                encoding="utf-8",
+            )
+
+            with (
+                mock.patch.object(
+                    evidence,
+                    "MAX_VALIDATION_EVIDENCE_BYTES",
+                    path.stat().st_size - 1,
+                ),
+                self.assertRaisesRegex(
+                    evidence.ValidationEvidenceError,
+                    "byte limit",
+                ),
+            ):
+                evidence.load_and_validate_result_file(path, [K2_SMALL])
+
+    def test_result_file_at_byte_limit_is_accepted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "result.json"
+            expected = passing_result(capability=False)
+            path.write_text(json.dumps([expected]), encoding="utf-8")
+
+            with mock.patch.object(
+                evidence,
+                "MAX_VALIDATION_EVIDENCE_BYTES",
+                path.stat().st_size,
+            ):
+                records = evidence.load_and_validate_result_file(path, [K2_SMALL])
+
+        self.assertEqual(records, [expected])
+
+    def test_result_file_symlink_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.json"
+            source.write_text(
+                json.dumps([passing_result(capability=False)]),
+                encoding="utf-8",
+            )
+            path = root / "result.json"
+            try:
+                path.symlink_to(source.name)
+            except OSError as exc:
+                self.skipTest(f"symlinks unavailable: {exc}")
+
+            with self.assertRaisesRegex(
+                evidence.ValidationEvidenceError,
+                "regular file",
+            ):
+                evidence.load_and_validate_result_file(path, [K2_SMALL])
+
+    def test_result_and_capability_schemas_reject_unknown_fields(self) -> None:
+        def add_result_field(records: list[dict]) -> None:
+            records[0]["schema_version"] = 999
+
+        def add_matrix_field(records: list[dict]) -> None:
+            capability_record = next(
+                record for record in records if "capability_matrix" in record
+            )
+            capability_record["capability_matrix"]["verification"] = "failed"
+
+        def add_case_field(records: list[dict]) -> None:
+            capability_record = next(
+                record for record in records if "capability_matrix" in record
+            )
+            capability_record["capability_matrix"]["cases"][0][
+                "verification"
+            ] = "failed"
+
+        mutations = {
+            "result": add_result_field,
+            "capability matrix": add_matrix_field,
+            "capability case": add_case_field,
+        }
+        for name, mutate in mutations.items():
+            with self.subTest(name=name), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_expected_results(root)
+                target = root / evidence.EXPECTED_RESULT_FILES[0]
+                records = json.loads(target.read_text(encoding="utf-8"))
+                mutate(records)
+                target.write_text(json.dumps(records), encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    evidence.ValidationEvidenceError,
+                    "unexpected.*fields",
+                ):
+                    evidence.load_and_validate_results(root, expected_matrix())
+
     def test_runtime_models_must_exactly_match_each_planned_lane(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_expected_results(root)
-            target = root / "llamacpp_validation_rocm-stable.json"
+            target = root / "llamacpp_validation_windows-rocm-stable.json"
             target.write_text(
                 json.dumps([passing_result("some-other-model")]),
                 encoding="utf-8",
@@ -215,7 +363,24 @@ class LlamaCppValidationEvidenceTests(unittest.TestCase):
             ):
                 evidence.load_and_validate_results(root, expected_matrix())
 
+    def test_selected_models_must_exactly_match_expected_models(self) -> None:
+        matrix = expected_matrix()
+        matrix["include"][0]["models"] = []
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_expected_results(root, matrix)
+
+            with self.assertRaisesRegex(
+                evidence.ValidationEvidenceError,
+                "selected models",
+            ):
+                evidence.load_and_validate_results(root, matrix)
+
     def test_every_planned_lane_must_include_k2_small(self) -> None:
+        matrix = expected_matrix()
+        for row in matrix["include"]:
+            row["models"] = ["some-other-model"]
+            row["expected_models"] = ["some-other-model"]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             for filename in evidence.EXPECTED_RESULT_FILES:
@@ -230,25 +395,67 @@ class LlamaCppValidationEvidenceTests(unittest.TestCase):
             ):
                 evidence.load_and_validate_results(
                     root,
-                    expected_matrix(["some-other-model"]),
+                    matrix,
                 )
 
-    def test_inconsistent_planned_lane_sets_fail_closed(self) -> None:
+    def test_exact_per_lane_planned_model_sets_are_accepted(self) -> None:
         matrix = expected_matrix()
-        matrix["include"][2]["expected_models"] = [K2_SMALL, "another-model"]
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_expected_results(root, matrix)
+
+            results = evidence.load_and_validate_results(root, matrix)
+
+        self.assertEqual(
+            len(results["llamacpp_validation_windows-vulkan.json"]),
+            len(matrix["include"][0]["expected_models"]),
+        )
+
+    def test_exact_lane_mapping_is_required(self) -> None:
+        mutations = {}
+        missing = expected_matrix()
+        missing["include"].pop()
+        mutations["missing"] = missing
+        wrong_backend = expected_matrix()
+        wrong_backend["include"][2]["backend"] = "cuda"
+        mutations["backend"] = wrong_backend
+        wrong_pin = expected_matrix()
+        wrong_pin["include"][3]["managed_pin"] = "cpu"
+        mutations["pin"] = wrong_pin
+        wrong_platform = expected_matrix()
+        wrong_platform["include"][1]["build_platform"] = "windows"
+        mutations["platform"] = wrong_platform
+        wrong_runner = expected_matrix()
+        wrong_runner["include"][0]["runner"] = ["windows-latest"]
+        mutations["runner"] = wrong_runner
+
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             self.write_expected_results(root)
-            (root / "llamacpp_validation_rocm-nightly.json").write_text(
-                json.dumps([passing_result(K2_SMALL), passing_result("another-model")]),
-                encoding="utf-8",
-            )
+            for name, matrix in mutations.items():
+                with self.subTest(name=name):
+                    with self.assertRaisesRegex(
+                        evidence.ValidationEvidenceError,
+                        "scheduled validation lanes|mapping",
+                    ):
+                        evidence.load_and_validate_results(root, matrix)
 
-            with self.assertRaisesRegex(
-                evidence.ValidationEvidenceError,
-                "same planned model set",
-            ):
-                evidence.load_and_validate_results(root, matrix)
+    def test_large_k2_models_require_the_128gb_vulkan_lane(self) -> None:
+        for model in (
+            planning.K2_MEDIUM,
+            planning.K2_LARGE,
+            f"builtin.{planning.K2_MEDIUM}",
+            f"builtin.{planning.K2_LARGE}",
+        ):
+            matrix = expected_matrix({"linux-vulkan": [K2_SMALL, model]})
+            with self.subTest(model=model), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_expected_results(root, matrix)
+                with self.assertRaisesRegex(
+                    evidence.ValidationEvidenceError,
+                    "128gb",
+                ):
+                    evidence.load_and_validate_results(root, matrix)
 
     def test_capability_evidence_is_required_and_validated(self) -> None:
         mutations = {}
@@ -296,17 +503,107 @@ class LlamaCppValidationEvidenceTests(unittest.TestCase):
             ):
                 evidence.load_and_validate_results(root, expected_matrix())
 
+    def test_nonstandard_json_numeric_constants_fail_closed(self) -> None:
+        for constant in ("NaN", "Infinity", "-Infinity"):
+            with (
+                self.subTest(constant=constant),
+                tempfile.TemporaryDirectory() as directory,
+            ):
+                root = Path(directory)
+                self.write_expected_results(root)
+                target = root / evidence.EXPECTED_RESULT_FILES[0]
+                raw = target.read_text(encoding="utf-8").replace(
+                    '"tokens_per_second": 4.0',
+                    f'"tokens_per_second": {constant}',
+                    1,
+                )
+                target.write_text(raw, encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    evidence.ValidationEvidenceError,
+                    "nonstandard JSON numeric constant",
+                ):
+                    evidence.load_and_validate_results(root, expected_matrix())
+
+    def test_overflowed_numeric_metrics_fail_closed(self) -> None:
+        for field, value in (
+            ("time_to_first_token", "1e400"),
+            ("tokens_per_second", "1e400"),
+        ):
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                self.write_expected_results(root)
+                target = root / evidence.EXPECTED_RESULT_FILES[0]
+                raw = target.read_text(encoding="utf-8")
+                raw = raw.replace(
+                    f'"{field}": {passing_result()[field]}',
+                    f'"{field}": {value}',
+                    1,
+                )
+                target.write_text(raw, encoding="utf-8")
+
+                with self.assertRaisesRegex(
+                    evidence.ValidationEvidenceError,
+                    "non-finite JSON number",
+                ):
+                    evidence.load_and_validate_results(root, expected_matrix())
+
+    def test_overflowed_numeric_extra_field_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_expected_results(root)
+            target = root / evidence.EXPECTED_RESULT_FILES[0]
+            raw = target.read_text(encoding="utf-8").replace(
+                "{", '{"untrusted_extra": 1e400,', 1
+            )
+            target.write_text(raw, encoding="utf-8")
+
+            with self.assertRaisesRegex(
+                evidence.ValidationEvidenceError,
+                "non-finite JSON number",
+            ):
+                evidence.load_and_validate_results(root, expected_matrix())
+
+    def test_overflowed_numeric_extra_matrix_field_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.write_expected_results(root)
+            raw_matrix = json.dumps(expected_matrix()).replace(
+                "{", '{"untrusted_extra": 1e400,', 1
+            )
+
+            with (
+                mock.patch(
+                    "sys.argv",
+                    [
+                        "llamacpp_validation_evidence.py",
+                        "--directory",
+                        str(root),
+                        "--expected-matrix-json",
+                        raw_matrix,
+                    ],
+                ),
+                self.assertRaisesRegex(SystemExit, "1"),
+            ):
+                evidence.main()
+
     def test_non_designated_model_cannot_attach_capability_evidence(self) -> None:
-        other_model = "Other-Llama"
-        matrix = expected_matrix([K2_SMALL, other_model])
+        matrix = expected_matrix()
+        planned_models = matrix["include"][0]["expected_models"]
+        other_model = next(model for model in planned_models if model != K2_SMALL)
         records = [
-            passing_result(),
-            passing_result(other_model, capability=True),
+            passing_result(
+                model,
+                capability=model in {K2_SMALL, other_model},
+            )
+            for model in planned_models
         ]
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for filename in evidence.EXPECTED_RESULT_FILES:
-                (root / filename).write_text(json.dumps(records), encoding="utf-8")
+            self.write_expected_results(root, matrix)
+            (root / "llamacpp_validation_windows-vulkan.json").write_text(
+                json.dumps(records), encoding="utf-8"
+            )
 
             with self.assertRaisesRegex(
                 evidence.ValidationEvidenceError,

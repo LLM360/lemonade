@@ -1,9 +1,10 @@
 #pragma once
 
 #include <lemon/utils/process_manager.h>
+
+#include <memory>
 #include <string>
 #include <vector>
-#include <memory>
 
 namespace lemon::utils {
 
@@ -19,7 +20,8 @@ public:
         const std::string& working_dir,
         bool inherit_output,
         bool filter_health_logs,
-        const std::vector<std::pair<std::string, std::string>>& env_vars) = 0;
+        const std::vector<std::pair<std::string, std::string>>& env_vars,
+        std::shared_ptr<ProcessOutputCapture> output_capture) = 0;
 
     virtual void terminate(ProcessHandle handle) = 0;
     virtual bool is_running(ProcessHandle handle) = 0;

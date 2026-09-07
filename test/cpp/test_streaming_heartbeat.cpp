@@ -214,6 +214,105 @@ static void test_heartbeat_emission_during_pause_between_tokens() {
     check(telemetry_result.error_message.empty(), "stream completed without error");
 }
 
+static void test_heartbeat_emission_during_partial_frame_progress() {
+    httplib::Server backend;
+    std::atomic<bool> partial_frame_in_progress{false};
+    std::atomic<int> backend_progress_count{0};
+    std::atomic<int> heartbeat_during_partial_frame{0};
+
+    backend.Post("/v1/chat/completions",
+        [&](const httplib::Request&, httplib::Response& res) {
+            res.set_chunked_content_provider(
+                "text/event-stream",
+                [&](size_t, httplib::DataSink& sink) {
+                    const std::string prefix =
+                        "data: {\"choices\":[{\"delta\":{\"content\":\"";
+                    partial_frame_in_progress.store(
+                        true, std::memory_order_release);
+                    sink.write(prefix.data(), prefix.size());
+                    for (int fragment = 0; fragment < 40; ++fragment) {
+                        static constexpr char payload[] = "x";
+                        if (!sink.write(payload, sizeof(payload) - 1)) {
+                            partial_frame_in_progress.store(
+                                false, std::memory_order_release);
+                            return false;
+                        }
+                        std::this_thread::sleep_for(25ms);
+                    }
+                    partial_frame_in_progress.store(
+                        false, std::memory_order_release);
+
+                    const std::string suffix = "\"}}]}\n\n";
+                    sink.write(suffix.data(), suffix.size());
+                    const std::string done = "data: [DONE]\n\n";
+                    sink.write(done.data(), done.size());
+                    sink.done();
+                    return false;
+                });
+        });
+
+    const int port = backend.bind_to_any_port("127.0.0.1");
+    if (port <= 0) {
+        std::printf("[FAIL] failed to bind mock backend\n");
+        ++g_failures;
+        return;
+    }
+
+    std::thread backend_thread([&backend]() {
+        backend.listen_after_bind();
+    });
+    backend.wait_until_ready();
+
+    int data_chunk_count = 0;
+    int done_count = 0;
+    httplib::DataSink downstream;
+    downstream.write = [&](const char* data, size_t len) {
+        const std::string write(data, len);
+        if (write == ": ping\n\n" &&
+            partial_frame_in_progress.load(std::memory_order_acquire)) {
+            heartbeat_during_partial_frame.fetch_add(
+                1, std::memory_order_release);
+        }
+        if (write.find("\"content\":\"") != std::string::npos) {
+            ++data_chunk_count;
+        }
+        if (write.find("[DONE]") != std::string::npos) {
+            ++done_count;
+        }
+        return true;
+    };
+    downstream.done = []() {};
+    downstream.is_writable = []() { return true; };
+
+    lemon::StreamingProxy::TelemetryData telemetry_result;
+    lemon::StreamingProxy::forward_sse_stream(
+        "http://127.0.0.1:" + std::to_string(port) +
+            "/v1/chat/completions",
+        R"({"model":"test-model","stream":true})",
+        downstream,
+        [&](const lemon::StreamingProxy::TelemetryData& tel) {
+            telemetry_result = tel;
+        },
+        10,
+        [&]() {
+            backend_progress_count.fetch_add(1, std::memory_order_release);
+        },
+        100);
+
+    backend.stop();
+    backend_thread.join();
+
+    check(heartbeat_during_partial_frame.load(std::memory_order_acquire) >= 1,
+          "heartbeat reaches the client while an SSE frame is incomplete");
+    check(backend_progress_count.load(std::memory_order_acquire) > 1,
+          "partial SSE fragments retain backend-progress signaling");
+    check(data_chunk_count == 1,
+          "partial SSE fragments are forwarded as one complete frame");
+    check(done_count == 1, "partial-frame stream preserves one done marker");
+    check(telemetry_result.error_message.empty(),
+          "partial-frame stream completes without error");
+}
+
 static void test_heartbeat_client_disconnect_aborts_upstream() {
     httplib::Server backend;
     std::atomic<bool> release_backend{false};
@@ -293,6 +392,7 @@ static void test_heartbeat_client_disconnect_aborts_upstream() {
 int main() {
     test_heartbeat_emission_during_prefill();
     test_heartbeat_emission_during_pause_between_tokens();
+    test_heartbeat_emission_during_partial_frame_progress();
     test_heartbeat_client_disconnect_aborts_upstream();
 
     if (g_failures == 0) {

@@ -7,6 +7,7 @@ import copy
 import json
 import types
 import unittest
+from unittest import mock
 
 from test.utils import llamacpp_capability_validation as capabilities
 
@@ -25,6 +26,11 @@ class CapabilityHarness:
         self.default_tool_response_is_text = False
         self.stop_tool_call = False
         self.tool_reasoning = False
+        self.reasoning_by_effort = {
+            "high": "high reasoning",
+            "medium": "medium reasoning",
+            "low": None,
+        }
         self.tool_arguments = json.dumps(
             capabilities.EXPECTED_TOOL_ARGUMENTS,
             separators=(",", ":"),
@@ -120,10 +126,12 @@ class CapabilityHarness:
             )
         if "reasoning_effort" in kwargs_value:
             effort = kwargs_value["reasoning_effort"]
-            reasoning = f"{effort} reasoning"
-            if self.reasoning_marker == effort:
+            reasoning = self.reasoning_by_effort[effort]
+            if reasoning is not None and self.reasoning_marker == effort:
                 reasoning += " <ifm|think>"
-            message = {"content": "42", "reasoning_content": reasoning}
+            message = {"content": "42"}
+            if reasoning is not None:
+                message["reasoning_content"] = reasoning
             if self.stop_tool_call:
                 message["tool_calls"] = [self.tool_call()]
             return self.response(), self.openai(message)
@@ -267,6 +275,39 @@ class LlamaCppCapabilityTests(unittest.TestCase):
         )
         return active, matrix, passed, summary
 
+    def test_marker_scan_lazily_visits_a_wide_array(self) -> None:
+        marker = "<ifm|think_fast>"
+
+        class GuardedWideList(list):
+            def __len__(self):
+                return 200_000
+
+            def __getitem__(self, index):
+                if index == 0:
+                    return marker
+                raise AssertionError("marker scan eagerly accessed a later sibling")
+
+            def __iter__(self):
+                yield marker
+                raise AssertionError("marker scan continued after the first marker")
+
+        found = capabilities.find_raw_ifm_control_marker(
+            GuardedWideList(),
+            "response.items",
+        )
+
+        self.assertEqual(found, (marker, "response.items[0]"))
+
+    def test_marker_scan_preserves_depth_first_path_order(self) -> None:
+        found = capabilities.find_raw_ifm_control_marker(
+            {
+                "first": ["safe", {"text": "<ifm|think_faster>"}],
+                "second": "<ifm|think>",
+            }
+        )
+
+        self.assertEqual(found, ("<ifm|think_faster>", "response.first[1].text"))
+
     def test_complete_profile_exercises_the_exact_contract(self) -> None:
         harness, matrix, passed, summary = self.run_profile()
 
@@ -278,6 +319,8 @@ class LlamaCppCapabilityTests(unittest.TestCase):
             [case["id"] for case in matrix["cases"]],
             list(capabilities.K2_HORIZON_CASE_IDS),
         )
+        self.assertEqual(len(capabilities.K2_HORIZON_CASE_IDS), 14)
+        self.assertIn("openai_tool_xml_typed", capabilities.K2_HORIZON_CASE_IDS)
         capabilities.validate_capability_matrix_evidence(
             matrix,
             capabilities.K2_HORIZON_PROFILE,
@@ -359,6 +402,21 @@ class LlamaCppCapabilityTests(unittest.TestCase):
                 MODEL,
             )
 
+    def test_low_reasoning_requires_the_deterministic_blank_think_faster_result(
+        self,
+    ) -> None:
+        harness = CapabilityHarness()
+        harness.reasoning_by_effort["low"] = "unexpected low reasoning"
+
+        _harness, matrix, passed, summary = self.run_profile(harness)
+
+        self.assertFalse(passed)
+        self.assertEqual(
+            [case["id"] for case in matrix["cases"] if not case["pass"]],
+            ["openai_reasoning_low"],
+        )
+        self.assertIn("reasoning_content", summary)
+
     def test_stream_requires_a_terminal_done_frame(self) -> None:
         harness = CapabilityHarness()
         harness.omit_stream_done = True
@@ -408,6 +466,22 @@ class LlamaCppCapabilityTests(unittest.TestCase):
         )
         self.assertNotIn("openai_plain_off_stream", failed_ids)
 
+    def test_stream_responses_are_bound_to_the_requested_model(self) -> None:
+        harness = CapabilityHarness()
+        harness.stream_response_models = ["builtin.Not-K2", "builtin.Not-K2"]
+
+        _harness, matrix, passed, _summary = self.run_profile(harness)
+
+        self.assertFalse(passed)
+        self.assertEqual(
+            {case["id"] for case in matrix["cases"] if not case["pass"]},
+            {
+                "openai_plain_off_stream",
+                "openai_reasoning_high_stream",
+                "openai_tool_stream_xml",
+            },
+        )
+
     def test_stream_reasoning_requires_separate_marker_free_content(self) -> None:
         for stream_reasoning in ("", "high <ifm|think> reasoning"):
             with self.subTest(stream_reasoning=stream_reasoning):
@@ -422,11 +496,11 @@ class LlamaCppCapabilityTests(unittest.TestCase):
                     {"openai_reasoning_high_stream"},
                 )
 
-    def test_stream_accepts_a_stable_backend_model_identity(self) -> None:
+    def test_stream_accepts_the_canonical_requested_model_identity(self) -> None:
         harness = CapabilityHarness()
         harness.stream_response_models = [
-            "K2-Horizon-1B-BF16.gguf",
-            "K2-Horizon-1B-BF16.gguf",
+            MODEL.removeprefix("builtin."),
+            MODEL.removeprefix("builtin."),
         ]
 
         _harness, _matrix, passed, summary = self.run_profile(harness)
@@ -434,11 +508,12 @@ class LlamaCppCapabilityTests(unittest.TestCase):
         self.assertTrue(passed, summary)
 
     def test_stream_rejects_changed_or_missing_backend_model_identity(self) -> None:
+        canonical_model = MODEL.removeprefix("builtin.")
         cases = (
-            ["K2-Horizon-1B-BF16.gguf", "different.gguf"],
-            [None, "K2-Horizon-1B-BF16.gguf"],
-            ["K2-Horizon-1B-BF16.gguf", None],
-            ["K2-Horizon-1B-BF16.gguf", "   "],
+            [canonical_model, "different.gguf"],
+            [None, canonical_model],
+            [canonical_model, None],
+            [canonical_model, "   "],
         )
         for stream_models in cases:
             with self.subTest(stream_models=stream_models):
@@ -479,6 +554,185 @@ class LlamaCppCapabilityTests(unittest.TestCase):
                     f"repeats key '{duplicate_key}'",
                 ):
                     capabilities._decode_openai_stream([event, "data: [DONE]"])
+
+    def test_stream_enforces_an_independent_wall_clock_deadline(self) -> None:
+        events = [
+            "data: "
+            + json.dumps(
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "42"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with (
+            mock.patch("time.monotonic", side_effect=[0.0, 10**9]),
+            self.assertRaisesRegex(
+                capabilities.CapabilityValidationError,
+                "wall-clock deadline",
+            ),
+        ):
+            capabilities._decode_openai_stream(events)
+
+    def test_stream_rejects_an_event_count_above_the_bound(self) -> None:
+        terminal_events = [
+            "data: "
+            + json.dumps(
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "42"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ),
+            "data: [DONE]",
+        ]
+        events = [": keep-alive"] + terminal_events
+
+        with (
+            mock.patch.object(capabilities, "MAX_STREAM_EVENTS", 1),
+            self.assertRaisesRegex(
+                capabilities.CapabilityValidationError,
+                "event count",
+            ),
+        ):
+            capabilities._decode_openai_stream(events)
+
+    def test_stream_event_bound_ignores_blank_lines_and_heartbeats(self) -> None:
+        terminal_events = [
+            "data: "
+            + json.dumps(
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "42"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ),
+            "data: [DONE]",
+        ]
+        events = [item for _index in range(2500) for item in ("", ": heartbeat")]
+        events.extend(terminal_events)
+
+        with mock.patch.object(capabilities, "MAX_STREAM_EVENTS", 2):
+            message, finish_reason, saw_done, model = (
+                capabilities._decode_openai_stream(events)
+            )
+
+        self.assertEqual(message["content"], "42")
+        self.assertEqual(finish_reason, "stop")
+        self.assertTrue(saw_done)
+        self.assertEqual(model, MODEL)
+
+    def test_stream_rejects_total_sse_bytes_above_the_bound(self) -> None:
+        events = [
+            ":xxxx",
+            "data: "
+            + json.dumps(
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "42"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with (
+            mock.patch.object(capabilities, "MAX_STREAM_SSE_BYTES", 5),
+            self.assertRaisesRegex(
+                capabilities.CapabilityValidationError,
+                "SSE byte count",
+            ),
+        ):
+            capabilities._decode_openai_stream(events)
+
+    def test_stream_rejects_accumulated_content_above_the_bound(self) -> None:
+        events = [
+            "data: "
+            + json.dumps(
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {"content": "xxx"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with (
+            mock.patch.object(capabilities, "MAX_STREAM_TEXT_BYTES", 2),
+            self.assertRaisesRegex(
+                capabilities.CapabilityValidationError,
+                "content and reasoning",
+            ),
+        ):
+            capabilities._decode_openai_stream(events)
+
+    def test_stream_rejects_tool_arguments_above_the_bound(self) -> None:
+        events = [
+            "data: "
+            + json.dumps(
+                {
+                    "model": MODEL,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_large",
+                                        "type": "function",
+                                        "function": {
+                                            "name": capabilities.TOOL_NAME,
+                                            "arguments": "xxx",
+                                        },
+                                    }
+                                ]
+                            },
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                }
+            ),
+            "data: [DONE]",
+        ]
+
+        with (
+            mock.patch.object(capabilities, "MAX_STREAM_TOOL_ARGUMENT_BYTES", 2),
+            self.assertRaisesRegex(
+                capabilities.CapabilityValidationError,
+                "tool arguments",
+            ),
+        ):
+            capabilities._decode_openai_stream(events)
 
     def test_stream_rejects_choice_chunks_after_finish_reason(self) -> None:
         later_choices = (
@@ -531,8 +785,8 @@ class LlamaCppCapabilityTests(unittest.TestCase):
         arguments = (
             '{"city":"London","city":"Paris","unit":"celsius",'
             '"days":2,"include_hourly":false}',
-            '{"city":"Paris","unit":"celsius","days":2.0,' '"include_hourly":false}',
-            '{"city":"Paris","unit":"celsius","days":2,' '"include_hourly":0}',
+            '{"city":"Paris","unit":"celsius","days":2.0,"include_hourly":false}',
+            '{"city":"Paris","unit":"celsius","days":2,"include_hourly":0}',
         )
 
         for tool_arguments in arguments:
@@ -553,6 +807,32 @@ class LlamaCppCapabilityTests(unittest.TestCase):
                         "openai_tool_xml_typed",
                     }.issubset(failed_ids)
                 )
+
+    def test_malformed_xml_typed_tool_response_is_rejected_hard(self) -> None:
+        harness = CapabilityHarness()
+        payload = capabilities._tool_payload(MODEL, "xml_typed", stream=False)
+
+        for finish_reason, arguments in (
+            ("stop", harness.tool_arguments),
+            ("tool_calls", '{"city":'),
+        ):
+            with self.subTest(finish_reason=finish_reason, arguments=arguments):
+                harness.tool_arguments = arguments
+
+                def request_json(_method, _url, timeout, **_kwargs):
+                    self.assertEqual(timeout, 60)
+                    return harness.response(), harness.openai(
+                        {"content": None, "tool_calls": [harness.tool_call()]},
+                        finish_reason,
+                    )
+
+                with self.assertRaises(capabilities.CapabilityValidationError):
+                    capabilities._openai_tool_case(
+                        request_json,
+                        "http://localhost:13305/api/v1/chat/completions",
+                        60,
+                        payload,
+                    )
 
     def test_omitted_tool_format_requires_the_xml_default(self) -> None:
         harness = CapabilityHarness()

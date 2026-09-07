@@ -131,7 +131,7 @@ def get_cli_binary():
     return _config["cli_binary"]
 
 
-def wait_for_server(port=PORT, timeout=60):
+def wait_for_server(port=PORT, timeout=60, host="localhost"):
     """
     Wait for the server to start by checking if the port is available.
 
@@ -147,7 +147,7 @@ def wait_for_server(port=PORT, timeout=60):
         if time.time() - start_time > timeout:
             raise TimeoutError(f"Server failed to start within {timeout} seconds")
         try:
-            conn = socket.create_connection(("localhost", port))
+            conn = socket.create_connection((host, port))
             conn.close()
             return True
         except socket.error:
@@ -181,13 +181,13 @@ def set_server_config(config: dict, port=PORT):
     return response.json()
 
 
-def unload_all_models(port=PORT, attempts=3):
+def unload_all_models(port=PORT, attempts=3, host="localhost"):
     """POST /api/v1/unload to unload all models for clean state."""
     response = None
     for attempt in range(1, attempts + 1):
         try:
             response = requests.post(
-                f"http://localhost:{port}/api/v1/unload",
+                f"http://{host}:{port}/api/v1/unload",
                 json={},
                 headers=_auth_headers(),
                 timeout=30,
@@ -280,7 +280,7 @@ def _is_transient_pull_status(status_code):
     return status_code in {408, 409, 429, 500, 502, 503, 504}
 
 
-def _pull_model_streaming(model_name, port):
+def _pull_model_streaming(model_name, port, host="localhost"):
     """Pull via the SSE streaming mode and block until the download completes.
 
     Large models (10+ GB) exceed any fixed read timeout on the synchronous
@@ -288,7 +288,7 @@ def _pull_model_streaming(model_name, port):
     applies between events, not to the whole download.
     """
     with requests.post(
-        f"http://localhost:{port}/api/v1/pull",
+        f"http://{host}:{port}/api/v1/pull",
         json={"model_name": model_name, "stream": True},
         stream=True,
         timeout=TIMEOUT_MODEL_OPERATION,
@@ -312,7 +312,7 @@ def _pull_model_streaming(model_name, port):
         return 500, "SSE stream ended without a 'complete' event"
 
 
-def pull_model_with_retry(model_name, attempts=3, port=PORT):
+def pull_model_with_retry(model_name, attempts=3, port=PORT, host="localhost"):
     """Pull a model with bounded retry for transient setup failures.
 
     Test setup should tolerate one-off transient pull failures, but persistent
@@ -327,7 +327,7 @@ def pull_model_with_retry(model_name, attempts=3, port=PORT):
             time.sleep(min(30, 2 ** (attempt - 1)))
 
         try:
-            status, body = _pull_model_streaming(model_name, port)
+            status, body = _pull_model_streaming(model_name, port, host=host)
         except requests.RequestException as exc:
             last_error = exc
             if attempt < attempts:

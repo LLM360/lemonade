@@ -208,6 +208,95 @@ int main() {
     ScopedEnvVar path_env("PATH");
     ScopedEnvVar hip_env("LEMONADE_GGML_HIP_PATH");
 
+    check(lemon::backends::llamacpp::detail::identifies_k2_horizon_model(
+              "builtin.K2-Horizon-0.9B-GGUF", "", ""),
+          "identifies K2-Horizon from the selected model name");
+    check(lemon::backends::llamacpp::detail::identifies_k2_horizon_model(
+              "user.custom", "IFM/K2_Horizon-7B-GGUF:model.gguf", ""),
+          "identifies K2-Horizon from the checkpoint");
+    check(lemon::backends::llamacpp::detail::identifies_k2_horizon_model(
+              "user.custom", "example/model:model.gguf", "k2-horizon"),
+          "identifies K2-Horizon from GGUF architecture metadata");
+    check(!lemon::backends::llamacpp::detail::identifies_k2_horizon_model(
+              "Tiny-Test-Model-GGUF", "unsloth/gemma-3-GGUF:model.gguf", "gemma3"),
+          "does not classify an ordinary GGUF model as K2-Horizon");
+    check(!lemon::backends::llamacpp::detail::identifies_k2_horizon_model(
+              "user.K2-Horizon-Alias",
+              "IFM/K2-Horizon-7B-GGUF:model.gguf",
+              "gemma3"),
+          "uses nonempty GGUF architecture instead of model-name fallbacks");
+    check(!lemon::backends::llamacpp::detail::should_report_k2_system_startup_diagnostic(
+              "system", false, "builtin.K2-Horizon-0.9B-GGUF", "", ""),
+          "requires unsupported-architecture evidence for the K2 diagnostic");
+    const std::string unsupported_k2_architecture =
+        "error loading model: unknown model architecture: 'k2-horizon'";
+    check(lemon::backends::llamacpp::detail::should_report_k2_system_startup_diagnostic(
+              "system",
+              false,
+              "builtin.K2-Horizon-0.9B-GGUF",
+              "",
+              "",
+              unsupported_k2_architecture),
+          "reports a K2 diagnostic for concrete unsupported-architecture evidence");
+    check(!lemon::backends::llamacpp::detail::should_report_k2_system_startup_diagnostic(
+              "system",
+              false,
+              "builtin.K2-Horizon-0.9B-GGUF",
+              "",
+              "",
+              "error loading model: failed to allocate compute buffers"),
+          "keeps the ordinary diagnostic for a K2 resource failure");
+    check(!lemon::backends::llamacpp::detail::should_report_k2_system_startup_diagnostic(
+              "vulkan", false, "builtin.K2-Horizon-0.9B-GGUF", "", ""),
+          "does not report the system diagnostic for a managed backend");
+    check(!lemon::backends::llamacpp::detail::should_report_k2_system_startup_diagnostic(
+              "system", false, "Tiny-Test-Model-GGUF", "", "gemma3"),
+          "does not report the K2 diagnostic for an ordinary model");
+    check(!lemon::backends::llamacpp::detail::should_report_k2_system_startup_diagnostic(
+              "system", true, "builtin.K2-Horizon-0.9B-GGUF", "", ""),
+          "does not classify a cancelled K2 load as binary incompatibility");
+    check(lemon::backends::llamacpp::detail::parse_system_llamacpp_version(
+              "version: 4242 (incompatible mock)") == "b4242",
+          "parses the incompatible system binary version");
+    check(lemon::backends::llamacpp::detail::parse_system_llamacpp_version(
+              "version: 0.3.0-dev (build 10671, commit 35999d101)\n"
+              "built with AppleClang 21.0.0.21000101 for Darwin arm64") ==
+              "b10671",
+          "parses the build number from the required IFM binary version");
+    check(lemon::backends::llamacpp::detail::parse_system_llamacpp_version("") ==
+              "unknown",
+          "reports an unknown system binary version when probing returns no output");
+    check(lemon::backends::llamacpp::detail::parse_system_llamacpp_version(
+              "Failed to execute: missing-llama-server", 1) == "unknown",
+          "ignores captured stderr when the version probe fails");
+
+    const std::string diagnostic =
+        lemon::backends::llamacpp::detail::k2_horizon_system_startup_error(
+            "builtin.K2-Horizon-0.9B-GGUF",
+            "/opt/old-llama/bin/llama-server",
+            "b4242",
+            unsupported_k2_architecture);
+    check(diagnostic.find("builtin.K2-Horizon-0.9B-GGUF") != std::string::npos,
+          "K2 startup diagnostic names the selected model");
+    check(diagnostic.find("/opt/old-llama/bin/llama-server") != std::string::npos,
+          "K2 startup diagnostic names the selected executable");
+    check(diagnostic.find("b4242") != std::string::npos,
+          "K2 startup diagnostic includes the detected version");
+    check(diagnostic.find("Original error: " + unsupported_k2_architecture) !=
+              std::string::npos,
+          "K2 startup diagnostic preserves the original startup error");
+    check(diagnostic.find("model/K2Horizon") != std::string::npos &&
+              diagnostic.find("PATH") != std::string::npos,
+          "K2 startup diagnostic provides the IFM branch remediation");
+    const std::string unknown_version_diagnostic =
+        lemon::backends::llamacpp::detail::k2_horizon_system_startup_error(
+            "builtin.K2-Horizon-0.9B-GGUF",
+            "/opt/old-llama/bin/llama-server",
+            "detected",
+            "llama-server failed to start");
+    check(unknown_version_diagnostic.find("version unknown") != std::string::npos,
+          "K2 startup diagnostic reports unknown for an unparseable version");
+
     // PATH discovery is a direct C++ decision: no lemond is needed to prove it.
     path_env.set(system_bin.string());
     check(!lemon::utils::find_executable_in_path("llama-server").empty(),

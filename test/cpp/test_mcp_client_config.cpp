@@ -1,5 +1,6 @@
 #include "lemon/mcp_client.h"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
@@ -14,10 +15,97 @@
 #include <thread>
 #include <vector>
 
+#if defined(LEMONADE_MCP_PROCESS_TEST_HOOK) && !defined(_WIN32)
+    #include <cerrno>
+    #include <sys/types.h>
+    #include <sys/wait.h>
+
+using McpProcessTestHook = void (*)(pid_t);
+extern "C" void lemonade_test_set_mcp_process_hooks(
+    McpProcessTestHook exit_observed, McpProcessTestHook group_cleanup,
+    McpProcessTestHook final_reap);
+#endif
+
 namespace fs = std::filesystem;
 using namespace std::chrono_literals;
 
 namespace {
+
+#if defined(LEMONADE_MCP_PROCESS_TEST_HOOK) && \
+    defined(LEMONADE_TEST_PYTHON) && \
+    defined(LEMONADE_TEST_MCP_STDIO_SERVER)
+std::atomic<int> mcp_process_hook_sequence{0};
+std::atomic<int> mcp_exit_observed_order{-1};
+std::atomic<int> mcp_group_cleanup_order{-1};
+std::atomic<int> mcp_final_reap_order{-1};
+std::atomic<bool> mcp_leader_reserved{false};
+std::atomic<bool> mcp_leader_reserved_after_cleanup{false};
+std::atomic<bool> mcp_leader_absent_after_reap{false};
+
+bool exited_child_is_reserved(pid_t pid) {
+    siginfo_t child_info{};
+    int result;
+    do {
+        result = ::waitid(P_PID, static_cast<id_t>(pid), &child_info,
+                          WEXITED | WNOHANG | WNOWAIT);
+    } while (result < 0 && errno == EINTR);
+    return result == 0 && child_info.si_pid == pid;
+}
+
+void record_mcp_exit_observed(pid_t pid) {
+    mcp_leader_reserved.store(exited_child_is_reserved(pid));
+    mcp_exit_observed_order.store(mcp_process_hook_sequence.fetch_add(1));
+}
+
+void record_mcp_group_cleanup(pid_t pid) {
+    mcp_leader_reserved_after_cleanup.store(exited_child_is_reserved(pid));
+    mcp_group_cleanup_order.store(mcp_process_hook_sequence.fetch_add(1));
+}
+
+void record_mcp_final_reap(pid_t pid) {
+    siginfo_t child_info{};
+    errno = 0;
+    int result;
+    do {
+        result = ::waitid(P_PID, static_cast<id_t>(pid), &child_info,
+                          WEXITED | WNOHANG | WNOWAIT);
+    } while (result < 0 && errno == EINTR);
+    mcp_leader_absent_after_reap.store(result < 0 && errno == ECHILD);
+    mcp_final_reap_order.store(mcp_process_hook_sequence.fetch_add(1));
+}
+
+class McpProcessHookGuard {
+public:
+    McpProcessHookGuard() {
+        mcp_process_hook_sequence.store(0);
+        mcp_exit_observed_order.store(-1);
+        mcp_group_cleanup_order.store(-1);
+        mcp_final_reap_order.store(-1);
+        mcp_leader_reserved.store(false);
+        mcp_leader_reserved_after_cleanup.store(false);
+        mcp_leader_absent_after_reap.store(false);
+        lemonade_test_set_mcp_process_hooks(
+            record_mcp_exit_observed, record_mcp_group_cleanup,
+            record_mcp_final_reap);
+    }
+
+    ~McpProcessHookGuard() {
+        lemonade_test_set_mcp_process_hooks(nullptr, nullptr, nullptr);
+    }
+};
+
+void verify_mcp_process_hook_result() {
+    const bool order_is_valid = mcp_exit_observed_order.load() == 0 &&
+                                mcp_group_cleanup_order.load() == 1 &&
+                                mcp_final_reap_order.load() == 2;
+    if (!mcp_leader_reserved.load() ||
+        !mcp_leader_reserved_after_cleanup.load() ||
+        !mcp_leader_absent_after_reap.load() || !order_is_valid) {
+        throw std::runtime_error(
+            "MCP POSIX stop did not retain the leader through group cleanup");
+    }
+}
+#endif
 
 void set_test_env(const std::string& name, const std::string& value) {
 #ifdef _WIN32
@@ -234,18 +322,30 @@ int run_tests() {
         // Reconnect and verify that a child process exiting without a response
         // wakes the request immediately rather than waiting for its full timeout.
         manager.connect_server_json(id);
-        const auto exit_start = std::chrono::steady_clock::now();
-        assert(throws([&] {
-            manager.call_tool_json(
-                id, json{{"name", "exit"},
-                         {"arguments", json::object()},
-                         {"timeout_ms", 10000}});
-        }));
-        const auto exit_elapsed =
-            std::chrono::steady_clock::now() - exit_start;
-        assert(exit_elapsed < 5s);
+        {
+#ifdef LEMONADE_MCP_PROCESS_TEST_HOOK
+            McpProcessHookGuard process_hook_guard;
+#endif
+            const auto exit_start = std::chrono::steady_clock::now();
+            const bool exit_failed = throws([&] {
+                manager.call_tool_json(
+                    id, json{{"name", "exit"},
+                             {"arguments", json::object()},
+                             {"timeout_ms", 10000}});
+            });
+            const auto exit_elapsed =
+                std::chrono::steady_clock::now() - exit_start;
+            if (!exit_failed || exit_elapsed >= 5s) {
+                throw std::runtime_error(
+                    "MCP process exit did not wake the pending request");
+            }
 
-        manager.remove_server_json(id);
+            manager.remove_server_json(id);
+#ifdef LEMONADE_MCP_PROCESS_TEST_HOOK
+            verify_mcp_process_hook_result();
+            std::cout << "MCP POSIX process lifecycle hook checks passed\n";
+#endif
+        }
 
         // Disconnect must also cancel initialization in progress. This covers a
         // race where disconnect could previously return before connect installed

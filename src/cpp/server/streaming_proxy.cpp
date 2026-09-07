@@ -1,9 +1,13 @@
 #include "lemon/streaming_proxy.h"
-#include <sstream>
-#include <iostream>
+#include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <exception>
+#include <iostream>
+#include <optional>
+#include <sstream>
 #include <stdexcept>
+#include <utility>
 #include <curl/curl.h>
 #include <lemon/utils/aixlog.hpp>
 
@@ -89,6 +93,209 @@ bool is_gpu_hang_or_compute_error(const std::string& message) {
            lowered.find("gpu hang") != std::string::npos;
 }
 
+std::optional<std::string> sse_event_data(const std::string& frame) {
+    std::string event_data;
+    bool has_data_field = false;
+    std::size_t line_start = 0;
+    while (line_start < frame.size()) {
+        const std::size_t terminator =
+            frame.find_first_of("\r\n", line_start);
+        const std::size_t content_end =
+            terminator == std::string::npos ? frame.size() : terminator;
+        const std::size_t content_length = content_end - line_start;
+        const bool empty_data_field =
+            content_length == 4 &&
+            frame.compare(line_start, content_length, "data") == 0;
+        const bool data_field =
+            content_length >= 5 && frame.compare(line_start, 5, "data:") == 0;
+        if (empty_data_field || data_field) {
+            if (has_data_field) {
+                event_data.push_back('\n');
+            }
+            if (data_field) {
+                std::size_t payload_start = line_start + 5;
+                if (payload_start < content_end &&
+                    frame[payload_start] == ' ') {
+                    ++payload_start;
+                }
+                event_data.append(
+                    frame, payload_start, content_end - payload_start);
+            }
+            has_data_field = true;
+        }
+
+        if (terminator == std::string::npos) {
+            break;
+        }
+        line_start = terminator + 1;
+        if (frame[terminator] == '\r' && line_start < frame.size() &&
+            frame[line_start] == '\n') {
+            ++line_start;
+        }
+    }
+
+    if (!has_data_field) {
+        return std::nullopt;
+    }
+    return event_data;
+}
+
+bool is_sse_done_frame(const std::string& frame) {
+    const std::optional<std::string> event_data = sse_event_data(frame);
+    return event_data.has_value() && *event_data == "[DONE]";
+}
+
+class SseFrameBuffer {
+public:
+    explicit SseFrameBuffer(std::size_t max_frame_bytes)
+        : max_frame_bytes_(max_frame_bytes) {}
+
+    template <typename FrameCallback, typename LineCallback>
+    bool append(const char* data,
+                std::size_t length,
+                FrameCallback&& frame_callback,
+                LineCallback&& line_callback) {
+        std::size_t offset = 0;
+        while (offset < length) {
+            const std::size_t buffer_limit = max_frame_bytes_ + 1;
+            const std::size_t available = buffer_limit - buffer_.size();
+            const std::size_t append_size =
+                std::min(length - offset, available);
+            buffer_.append(data + offset, append_size);
+            offset += append_size;
+            if (!drain(false, frame_callback, line_callback)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    template <typename FrameCallback, typename LineCallback>
+    bool finish(FrameCallback&& frame_callback,
+                LineCallback&& line_callback) {
+        return drain(true, frame_callback, line_callback);
+    }
+
+    bool empty() const {
+        return buffer_.empty();
+    }
+
+    void clear() {
+        buffer_.clear();
+        scan_position_ = 0;
+        line_start_ = 0;
+    }
+
+private:
+    bool prepare_stream_start(bool end_of_stream) {
+        if (!stream_start_) {
+            return true;
+        }
+
+        static constexpr char utf8_bom[] = "\xEF\xBB\xBF";
+        constexpr std::size_t utf8_bom_size = sizeof(utf8_bom) - 1;
+        const std::size_t comparison_size =
+            std::min(buffer_.size(), utf8_bom_size);
+        if (buffer_.compare(
+                0, comparison_size, utf8_bom, comparison_size) != 0) {
+            stream_start_ = false;
+            return true;
+        }
+        if (buffer_.size() < utf8_bom_size && !end_of_stream) {
+            return false;
+        }
+        if (buffer_.size() >= utf8_bom_size) {
+            if (utf8_bom_removed_) {
+                throw std::runtime_error(
+                    "backend connection failed during SSE stream before DONE: "
+                    "multiple leading UTF-8 BOMs");
+            }
+            buffer_.erase(0, utf8_bom_size);
+            utf8_bom_removed_ = true;
+            return prepare_stream_start(end_of_stream);
+        }
+        stream_start_ = false;
+        return true;
+    }
+
+    template <typename FrameCallback, typename LineCallback>
+    bool drain(bool end_of_stream,
+               FrameCallback&& frame_callback,
+               LineCallback&& line_callback) {
+        if (!prepare_stream_start(end_of_stream)) {
+            return true;
+        }
+
+        std::size_t consumed = 0;
+        while (scan_position_ < buffer_.size()) {
+            const std::size_t terminator =
+                buffer_.find_first_of("\r\n", scan_position_);
+            if (terminator == std::string::npos) {
+                scan_position_ = buffer_.size();
+                break;
+            }
+
+            std::size_t terminator_length = 1;
+            if (buffer_[terminator] == '\r') {
+                if (terminator + 1 == buffer_.size() && !end_of_stream) {
+                    scan_position_ = terminator;
+                    break;
+                }
+                if (terminator + 1 < buffer_.size() &&
+                    buffer_[terminator + 1] == '\n') {
+                    terminator_length = 2;
+                }
+            }
+
+            const std::size_t terminated_end =
+                terminator + terminator_length;
+            if (terminated_end - consumed > max_frame_bytes_) {
+                throw_frame_too_large();
+            }
+
+            line_callback(
+                buffer_.substr(line_start_, terminator - line_start_));
+            const bool frame_complete = terminator == line_start_;
+            scan_position_ = terminated_end;
+            line_start_ = terminated_end;
+            if (!frame_complete) {
+                continue;
+            }
+
+            if (!frame_callback(
+                    buffer_.substr(consumed, terminated_end - consumed))) {
+                clear();
+                return false;
+            }
+            consumed = terminated_end;
+        }
+
+        if (buffer_.size() - consumed > max_frame_bytes_) {
+            throw_frame_too_large();
+        }
+        if (consumed > 0) {
+            buffer_.erase(0, consumed);
+            scan_position_ -= consumed;
+            line_start_ -= consumed;
+        }
+        return true;
+    }
+
+    [[noreturn]] void throw_frame_too_large() const {
+        throw std::runtime_error(
+            "backend connection failed during SSE stream before DONE: "
+            "SSE frame exceeds the maximum size of " +
+            std::to_string(max_frame_bytes_) + " bytes");
+    }
+
+    const std::size_t max_frame_bytes_;
+    std::string buffer_;
+    std::size_t scan_position_ = 0;
+    std::size_t line_start_ = 0;
+    bool stream_start_ = true;
+    bool utf8_bom_removed_ = false;
+};
+
 } // namespace
 
 
@@ -98,8 +305,42 @@ void StreamingProxy::forward_sse_stream(
     httplib::DataSink& sink,
     std::function<void(const TelemetryData&)> on_complete,
     long timeout_seconds,
-    std::function<void()> on_chunk,
-    long heartbeat_interval_ms) {
+    std::function<void()> on_backend_progress,
+    long heartbeat_interval_ms,
+    std::function<void()> on_frame) {
+    forward_sse_stream_impl(
+        backend_url, request_body, sink, nullptr, std::move(on_complete),
+        timeout_seconds, std::move(on_backend_progress), heartbeat_interval_ms,
+        std::move(on_frame));
+}
+
+void StreamingProxy::forward_transformed_sse_stream(
+    const std::string& backend_url,
+    const std::string& request_body,
+    httplib::DataSink& sink,
+    SseFrameTransform frame_transform,
+    std::function<void(const TelemetryData&)> on_complete,
+    long timeout_seconds,
+    std::function<void()> on_backend_progress,
+    long heartbeat_interval_ms,
+    std::function<void()> on_frame) {
+    forward_sse_stream_impl(
+        backend_url, request_body, sink, std::move(frame_transform),
+        std::move(on_complete), timeout_seconds,
+        std::move(on_backend_progress), heartbeat_interval_ms,
+        std::move(on_frame));
+}
+
+void StreamingProxy::forward_sse_stream_impl(
+    const std::string& backend_url,
+    const std::string& request_body,
+    httplib::DataSink& sink,
+    SseFrameTransform frame_transform,
+    std::function<void(const TelemetryData&)> on_complete,
+    long timeout_seconds,
+    std::function<void()> on_backend_progress,
+    long heartbeat_interval_ms,
+    std::function<void()> on_frame) {
 
     TelemetryData telemetry;
     try {
@@ -108,13 +349,14 @@ void StreamingProxy::forward_sse_stream(
             telemetry.model_name = req_json["model"].get<std::string>();
         }
     } catch (...) {}
-    std::string line_buffer;
+    SseFrameBuffer frame_buffer(kMaxSseFrameBytes);
+    std::exception_ptr frame_processing_error;
     bool stream_error = false;
     bool has_done_marker = false;
     bool has_first_token = false;
     double time_to_first_token = 0.0;
     const auto start_time = std::chrono::steady_clock::now();
-    auto last_activity_time = start_time;
+    auto last_downstream_write_time = start_time;
 
     int backend_status = 200;
     std::string error_body;
@@ -135,13 +377,54 @@ void StreamingProxy::forward_sse_stream(
         }
     };
 
+    auto process_frame = [&](const std::string& source_frame) {
+        const bool is_done_frame = is_sse_done_frame(source_frame);
+        has_done_marker = has_done_marker || is_done_frame;
+        std::string frame = frame_transform
+            ? frame_transform(source_frame)
+            : source_frame;
+        if (frame.empty()) {
+            return true;
+        }
+        if (!sink.write(frame.data(), frame.size())) {
+            return false;
+        }
+        last_downstream_write_time = std::chrono::steady_clock::now();
+
+        if (on_frame) {
+            on_frame();
+        }
+        if (!has_first_token &&
+            frame.find("data: ") != std::string::npos) {
+            has_first_token = true;
+            time_to_first_token = std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - start_time)
+                                      .count();
+        }
+        return true;
+    };
+
+    auto process_frame_bytes = [&](const char* data,
+                                   std::size_t length,
+                                   bool end_of_stream) {
+        try {
+            if (end_of_stream) {
+                return frame_buffer.finish(process_frame, process_line);
+            }
+            return frame_buffer.append(
+                data, length, process_frame, process_line);
+        } catch (...) {
+            frame_processing_error = std::current_exception();
+            frame_buffer.clear();
+            return false;
+        }
+    };
+
     utils::HttpResponse result = utils::HttpClient::post_stream(
         backend_url,
         request_body,
-        [&sink, &line_buffer, &has_done_marker, &has_first_token, &time_to_first_token,
-         &start_time, &last_activity_time, &on_chunk, &process_line, &backend_status, &error_body](const char* data, size_t length) {
-            last_activity_time = std::chrono::steady_clock::now();
-
+        [&backend_status, &error_body, &on_backend_progress,
+         &process_frame_bytes](const char* data, size_t length) {
             if (backend_status != 200) {
                 if (error_body.size() < max_error_body) {
                     error_body.append(data, std::min(length, max_error_body - error_body.size()));
@@ -149,35 +432,18 @@ void StreamingProxy::forward_sse_stream(
                 return true;
             }
 
-            if (on_chunk) {
-                on_chunk();
+            if (length > 0 && on_backend_progress) {
+                on_backend_progress();
             }
 
-            line_buffer.append(data, length);
-            process_sse_lines(line_buffer, process_line);
-
-            std::string chunk(data, length);
-            if (!has_first_token && chunk.find("data: ") != std::string::npos) {
-                has_first_token = true;
-                time_to_first_token = std::chrono::duration<double>(
-                    std::chrono::steady_clock::now() - start_time).count();
-            }
-
-            if (chunk.find("data: [DONE]") != std::string::npos) {
-                has_done_marker = true;
-            }
-
-            if (!sink.write(data, length)) {
-                return false;
-            }
-
-            return true;
+            return process_frame_bytes(data, length, false);
         },
         {},
         timeout_seconds,
         [&backend_status](int status) { backend_status = status; },
         utils::HttpSecurityPolicy::TrustedLoopback,
-        [&sink, &last_activity_time, &backend_status, heartbeat_interval_ms]() {
+        [&sink, &last_downstream_write_time, &backend_status,
+         heartbeat_interval_ms]() {
             if (sink.is_writable && !sink.is_writable()) {
                 return true;
             }
@@ -185,13 +451,13 @@ void StreamingProxy::forward_sse_stream(
             if (heartbeat_interval_ms > 0 && backend_status == 200) {
                 const auto now = std::chrono::steady_clock::now();
                 const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    now - last_activity_time).count();
+                    now - last_downstream_write_time).count();
                 if (elapsed >= heartbeat_interval_ms) {
                     static constexpr const char* heartbeat = ": ping\n\n";
                     if (!sink.write(heartbeat, std::strlen(heartbeat))) {
                         return true;
                     }
-                    last_activity_time = now;
+                    last_downstream_write_time = now;
                 }
             }
 
@@ -199,13 +465,35 @@ void StreamingProxy::forward_sse_stream(
         }
     );
 
+    const bool may_have_final_frame =
+        result.curl_code == CURLE_OK ||
+        result.curl_code == CURLE_PARTIAL_FILE ||
+        result.curl_code == CURLE_RECV_ERROR;
+    const bool eof_sink_rejected =
+        backend_status == 200 && may_have_final_frame &&
+        !process_frame_bytes(nullptr, 0, true);
+    const bool has_incomplete_frame = !frame_buffer.empty();
+    frame_buffer.clear();
+    if (frame_processing_error) {
+        std::rethrow_exception(frame_processing_error);
+    }
+    if (result.curl_code == CURLE_OK && backend_status == 200 &&
+        has_incomplete_frame) {
+        throw std::runtime_error(
+            "backend connection failed during SSE stream before DONE: "
+            "incomplete final event");
+    }
+
     const bool client_disconnected =
         result.curl_code == CURLE_WRITE_ERROR ||
-        result.curl_code == CURLE_ABORTED_BY_CALLBACK;
+        result.curl_code == CURLE_ABORTED_BY_CALLBACK || eof_sink_rejected;
     const bool transport_interrupted =
         result.curl_code == CURLE_PARTIAL_FILE || result.curl_code == CURLE_RECV_ERROR;
 
-    if (result.curl_code != CURLE_OK) {
+    if (eof_sink_rejected && result.curl_code == CURLE_OK) {
+        stream_error = true;
+        telemetry.error_message = "Client disconnected during stream";
+    } else if (result.curl_code != CURLE_OK) {
         if (client_disconnected) {
             stream_error = true;
             LOG(WARNING, "StreamingProxy") << "Client disconnected during SSE stream (CURL error: " << result.curl_error << ")" << std::endl;
@@ -278,13 +566,6 @@ void StreamingProxy::forward_sse_stream(
         sink.done();
 
         LOG(INFO, "Server") << "Streaming completed - 200 OK" << std::endl;
-
-        if (!line_buffer.empty()) {
-            if (line_buffer.back() == '\r') {
-                line_buffer.pop_back();
-            }
-            process_line(line_buffer);
-        }
 
         if (telemetry.time_to_first_token <= 0.0) {
             telemetry.time_to_first_token = time_to_first_token;

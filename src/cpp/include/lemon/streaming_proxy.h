@@ -1,7 +1,8 @@
 #pragma once
 
-#include <string>
+#include <cstddef>
 #include <functional>
+#include <string>
 #include <nlohmann/json.hpp>
 #include <httplib.h>
 #include "utils/http_client.h"
@@ -14,6 +15,11 @@ using json = nlohmann::json;
 
 class StreamingProxy {
 public:
+    static constexpr std::size_t kMaxSseFrameBytes = 1024 * 1024;
+
+    using SseFrameTransform =
+        std::function<std::string(const std::string& frame)>;
+
     struct TelemetryData {
         int input_tokens = 0;
         int output_tokens = 0;
@@ -54,8 +60,21 @@ public:
         httplib::DataSink& sink,
         std::function<void(const TelemetryData&)> on_complete = nullptr,
         long timeout_seconds = 300,
-        std::function<void()> on_chunk = nullptr,
-        long heartbeat_interval_ms = 1000
+        std::function<void()> on_backend_progress = nullptr,
+        long heartbeat_interval_ms = 1000,
+        std::function<void()> on_frame = nullptr
+    );
+
+    static void forward_transformed_sse_stream(
+        const std::string& backend_url,
+        const std::string& request_body,
+        httplib::DataSink& sink,
+        SseFrameTransform frame_transform,
+        std::function<void(const TelemetryData&)> on_complete = nullptr,
+        long timeout_seconds = 300,
+        std::function<void()> on_backend_progress = nullptr,
+        long heartbeat_interval_ms = 1000,
+        std::function<void()> on_frame = nullptr
     );
 
     static void forward_byte_stream(
@@ -78,6 +97,17 @@ public:
     static void accumulate_responses_delta(const nlohmann::json& parsed, std::string& accumulated_text);
 
 private:
+    static void forward_sse_stream_impl(
+        const std::string& backend_url,
+        const std::string& request_body,
+        httplib::DataSink& sink,
+        SseFrameTransform frame_transform,
+        std::function<void(const TelemetryData&)> on_complete,
+        long timeout_seconds,
+        std::function<void()> on_backend_progress,
+        long heartbeat_interval_ms,
+        std::function<void()> on_frame
+    );
 };
 
 } // namespace lemon

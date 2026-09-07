@@ -11,8 +11,8 @@
 #include "lemon/model_manager.h"
 #include <algorithm>
 #include <cctype>
+#include <cstddef>
 #include <filesystem>
-#include <regex>
 #include <system_error>
 #include <utility>
 #include "lemon/auto_tune.h"
@@ -81,6 +81,108 @@ static void push_arg(std::vector<std::string>& args,
     push_reserved(reserved, key, aliases);
 }
 
+static std::string normalize_sse_response_model_frame(
+    const std::string& frame,
+    const std::string& model_name) {
+    struct Line {
+        std::string text;
+        std::size_t content_end = 0;
+        std::size_t payload_start = 0;
+        bool is_data = false;
+    };
+
+    std::vector<Line> lines;
+    std::size_t line_start = 0;
+    while (line_start < frame.size()) {
+        const std::size_t terminator = frame.find_first_of("\r\n", line_start);
+        std::size_t line_end = frame.size();
+        if (terminator != std::string::npos) {
+            line_end = terminator + 1;
+            if (frame[terminator] == '\r' && line_end < frame.size() &&
+                frame[line_end] == '\n') {
+                ++line_end;
+            }
+        }
+
+        Line line;
+        line.text = frame.substr(line_start, line_end - line_start);
+        line.content_end = line.text.size();
+        if (line.content_end > 0 && line.text[line.content_end - 1] == '\n') {
+            --line.content_end;
+        }
+        if (line.content_end > 0 && line.text[line.content_end - 1] == '\r') {
+            --line.content_end;
+        }
+        if (line.text.rfind("data:", 0) == 0) {
+            line.is_data = true;
+            line.payload_start = std::strlen("data:");
+            if (line.payload_start < line.content_end &&
+                line.text[line.payload_start] == ' ') {
+                ++line.payload_start;
+            }
+        }
+        lines.push_back(std::move(line));
+        line_start = line_end;
+    }
+
+    std::string event_data;
+    std::size_t first_data_line = std::string::npos;
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        const Line& line = lines[index];
+        if (!line.is_data) {
+            continue;
+        }
+        if (first_data_line == std::string::npos) {
+            first_data_line = index;
+        } else {
+            event_data.push_back('\n');
+        }
+        event_data.append(
+            line.text, line.payload_start,
+            line.content_end - line.payload_start);
+    }
+
+    if (first_data_line == std::string::npos || event_data.empty() ||
+        event_data == "[DONE]") {
+        return frame;
+    }
+
+    json payload = json::parse(event_data, nullptr, false);
+    if (!payload.is_object()) {
+        throw std::runtime_error(
+            "backend connection failed during SSE stream before DONE: "
+            "invalid OpenAI SSE data event");
+    }
+
+    bool normalized = false;
+    if (payload.contains("model")) {
+        payload["model"] = model_name;
+        normalized = true;
+    }
+    if (payload.contains("response") && payload["response"].is_object() &&
+        payload["response"].contains("model")) {
+        payload["response"]["model"] = model_name;
+        normalized = true;
+    }
+    if (!normalized) {
+        return frame;
+    }
+
+    std::string output;
+    for (std::size_t index = 0; index < lines.size(); ++index) {
+        const Line& line = lines[index];
+        if (!line.is_data) {
+            output += line.text;
+        } else if (index == first_data_line) {
+            output.append(line.text, 0, line.payload_start);
+            output += payload.dump();
+            output.append(line.text, line.content_end,
+                          line.text.size() - line.content_end);
+        }
+    }
+    return output;
+}
+
 static std::string resolve_llamacpp_backend(const std::string& backend) {
     if (backend == "rocm") {
         // Map "rocm" to the appropriate channel based on config
@@ -91,6 +193,93 @@ static std::string resolve_llamacpp_backend(const std::string& backend) {
         return "rocm-" + channel;
     }
     return backend;
+}
+
+static std::string resolve_system_llamacpp_executable_path(
+    const std::string& executable) {
+    std::error_code ec;
+    fs::path executable_path = utils::path_from_utf8(executable);
+    if (executable_path.has_parent_path()) {
+        fs::path absolute_path = fs::absolute(executable_path, ec);
+        return ec ? executable : path_to_utf8(absolute_path);
+    }
+
+#ifdef _WIN32
+    const std::string resolved = utils::find_executable_in_path(executable);
+    return resolved.empty() ? executable : resolved;
+#else
+    const char* path_env = std::getenv("PATH");
+    if (!path_env || path_env[0] == '\0') {
+        return executable;
+    }
+
+    std::string path_value(path_env);
+    size_t start = 0;
+    while (start <= path_value.size()) {
+        const size_t end = path_value.find(':', start);
+        const std::string directory = path_value.substr(
+            start, end == std::string::npos ? std::string::npos : end - start);
+        if (!directory.empty()) {
+            fs::path candidate = fs::path(directory) / executable;
+            ec.clear();
+            if (fs::is_regular_file(candidate, ec) &&
+                access(candidate.c_str(), X_OK) == 0) {
+                fs::path absolute_path = fs::absolute(candidate, ec);
+                return ec ? path_to_utf8(candidate) : path_to_utf8(absolute_path);
+            }
+        }
+        if (end == std::string::npos) {
+            break;
+        }
+        start = end + 1;
+    }
+    return executable;
+#endif
+}
+
+static std::string detect_system_llamacpp_version(
+    const std::string& executable_path) {
+    constexpr std::size_t max_version_output_bytes = 4096;
+    ProcessHandle handle{};
+    try {
+        handle = ProcessManager::start_process(
+            executable_path, {"--version"}, "", false, false, {},
+            max_version_output_bytes);
+        const int exit_code = ProcessManager::wait_for_exit(handle, 10);
+        if (exit_code < 0) {
+            ProcessManager::kill_process(handle);
+            return "unknown";
+        }
+
+#ifndef _WIN32
+        handle.pid = 0;
+#endif
+        const std::string output = ProcessManager::read_output(
+            handle, static_cast<int>(max_version_output_bytes));
+#ifdef _WIN32
+        ProcessManager::reap_process(handle);
+#endif
+        handle = {};
+        return llamacpp::detail::parse_system_llamacpp_version(output,
+                                                               exit_code);
+    } catch (const std::exception&) {
+        if (handle.pid > 0 || handle.handle != nullptr) {
+            if (ProcessManager::is_running(handle)) {
+                ProcessManager::kill_process(handle);
+            } else {
+                ProcessManager::reap_process(handle);
+            }
+        }
+        return "unknown";
+    }
+}
+
+static bool custom_args_control_llamacpp_logging(
+    const std::vector<std::string>& args) {
+    return std::any_of(args.begin(), args.end(), [](const std::string& arg) {
+        return arg == "--log-file" || arg.rfind("--log-file=", 0) == 0 ||
+               arg == "--log-disable";
+    });
 }
 
 static bool is_llamacpp_rocm_backend(const std::string& backend) {
@@ -393,6 +582,9 @@ void LlamaCppServer::load(const std::string& model_name,
     }
     push_reserved(reserved_flags, "--reranking", std::vector<std::string>{"--rerank"});
 
+    bool user_controls_logging =
+        !utils::get_environment_variable_utf8("LLAMA_ARG_LOG_FILE").empty();
+
     // Validate and append custom arguments
     if (!llamacpp_args.empty()) {
         std::string validation_error = validate_custom_args(llamacpp_args, reserved_flags);
@@ -404,6 +596,8 @@ void LlamaCppServer::load(const std::string& model_name,
 
         LOG(DEBUG, "LlamaCpp") << "Adding custom arguments: " << llamacpp_args << std::endl;
         std::vector<std::string> custom_args_vec = parse_custom_args(llamacpp_args);
+        user_controls_logging = user_controls_logging ||
+                                custom_args_control_llamacpp_logging(custom_args_vec);
         args.insert(args.end(), custom_args_vec.begin(), custom_args_vec.end());
     }
 
@@ -573,16 +767,51 @@ void LlamaCppServer::load(const std::string& model_name,
 #endif
 
     bool inherit_llama_output = (log_level_ == "info") || is_debug();
-    set_process_handle(ProcessManager::start_process(
-        process_executable, args, working_dir, inherit_llama_output, true, env_vars),
-        process_executable, args);
+    constexpr std::size_t max_startup_output_bytes = 64 * 1024;
+    const std::size_t startup_output_bytes =
+        llamacpp_backend == "system" && !user_controls_logging &&
+                llamacpp::detail::identifies_k2_horizon_model(
+                    model_name, model_info.checkpoint(),
+                    model_info.gguf.architecture)
+            ? max_startup_output_bytes
+            : 0;
+    const ProcessHandle started_handle = ProcessManager::start_process(
+        process_executable, args, working_dir, inherit_llama_output, true,
+        env_vars, startup_output_bytes);
+    set_process_handle(started_handle, process_executable, args);
 
     if (!wait_for_ready("/health")) {
         const ProcessHandle handle = consume_process_handle_for_cleanup();
+        const bool process_still_running =
+            has_process_handle(handle) && ProcessManager::is_running(handle);
         if (has_process_handle(handle)) {
             ProcessManager::stop_process(handle);
         }
-        throw std::runtime_error("llama-server failed to start");
+        const std::string startup_error = "llama-server failed to start";
+        const bool load_cancelled = load_cancel_ && load_cancel_->load();
+        const bool k2_system_failure =
+            startup_output_bytes > 0 && !load_cancelled && !process_still_running;
+        const std::string startup_output =
+            k2_system_failure
+                ? ProcessManager::read_output(started_handle, 64 * 1024)
+                : "";
+        if (llamacpp::detail::should_report_k2_system_startup_diagnostic(
+                llamacpp_backend, load_cancelled, model_name,
+                model_info.checkpoint(), model_info.gguf.architecture,
+                startup_output)) {
+            const std::string system_executable =
+                resolve_system_llamacpp_executable_path(executable);
+            const std::string original_error =
+                llamacpp::detail::k2_horizon_unsupported_architecture_error(
+                    startup_output);
+            throw std::runtime_error(
+                llamacpp::detail::k2_horizon_system_startup_error(
+                    model_name,
+                    system_executable,
+                    detect_system_llamacpp_version(system_executable),
+                    original_error));
+        }
+        throw std::runtime_error(startup_error);
     }
 
     LOG(DEBUG, "LlamaCpp") << "Model loaded on port " << get_backend_port() << std::endl;
@@ -675,14 +904,35 @@ void LlamaCppServer::forward_streaming_request(const std::string& endpoint,
                                                long timeout_seconds,
                                                TelemetryCallback telemetry_callback) {
     std::string body = request_body;
-    if (endpoint == "/v1/chat/completions" || endpoint == "/v1/responses") {
+    std::string response_model;
+    const bool is_openai_text_endpoint =
+        endpoint == "/v1/chat/completions" ||
+        endpoint == "/v1/completions" || endpoint == "/v1/responses";
+    if (is_openai_text_endpoint) {
         json request = json::parse(request_body, nullptr, false);
         if (!request.is_discarded()) {
+            if (request.contains("model") && request["model"].is_string()) {
+                response_model = request["model"].get<std::string>();
+            }
             if (endpoint == "/v1/chat/completions") {
                 JsonUtils::add_legacy_max_tokens_alias(request);
+                request = llamacpp::sanitize_tool_schema_limits(std::move(request));
+                body = request.dump();
+            } else if (endpoint == "/v1/responses") {
+                request = llamacpp::sanitize_tool_schema_limits(std::move(request));
+                body = request.dump();
             }
-            body = llamacpp::sanitize_tool_schema_limits(std::move(request)).dump();
         }
+    }
+
+    if (sse && !response_model.empty()) {
+        WrappedServer::forward_streaming_request_impl(
+            endpoint, body, sink, sse, timeout_seconds, telemetry_callback,
+            [response_model](const std::string& frame) {
+                return normalize_sse_response_model_frame(
+                    frame, response_model);
+            });
+        return;
     }
 
     WrappedServer::forward_streaming_request(
@@ -701,44 +951,6 @@ std::unique_ptr<WrappedServer> create(const BackendContext& ctx) {
 }
 
 namespace {
-std::string system_llamacpp_version() {
-    std::string output;
-    #ifdef _WIN32
-    std::string command = "llama-server --version 2>NUL";
-    int rc = lemon::utils::ProcessManager::run_command(command, output);
-    #else
-    FILE* pipe = popen("llama-server --version 2>/dev/null", "r");
-    if (!pipe) {
-        return "unknown";
-    }
-
-    char buffer[256];
-    if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        output = buffer;
-    }
-
-    pclose(pipe);
-    #endif
-
-    // Parse version from output like "version: 3432 (e2b2a632)" or "llama.cpp version b3432"
-    if (!output.empty()) {
-        // Try to find a version number
-        std::regex version_regex(R"(version:\s*(\d+)|version\s+b?(\d+))");
-        std::smatch match;
-        if (std::regex_search(output, match, version_regex)) {
-            for (size_t i = 1; i < match.size(); ++i) {
-                if (match[i].matched) {
-                    return "b" + match[i].str();
-                }
-            }
-        }
-        return "detected";
-    }
-
-    return "unknown";
-}
-
-
 bool is_ggml_hip_plugin_available() {
 #ifdef __linux__
     // Allow distros/packagers that install outside the FHS paths below
@@ -878,7 +1090,8 @@ public:
                                 const std::string& file_version) const override {
         // The PATH-installed "system" llama-server has no version.txt; query it.
         if (backend == "system") {
-            return system_llamacpp_version();
+            return detect_system_llamacpp_version(
+                resolve_system_llamacpp_executable_path(descriptor.binary));
         }
         return file_version;
     }

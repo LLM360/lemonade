@@ -4,11 +4,11 @@ on:
   workflow_dispatch:
     inputs:
       lite:
-        description: 'Run in lite mode (smallest model only)'
+        description: 'Run only the K2-Horizon 0.9B smoke model'
         type: boolean
         default: false
       models:
-        description: 'Optional comma-separated model IDs (empty uses hot models)'
+        description: 'Additional comma-separated IDs; empty uses hot models + K2 0.9B'
         type: string
         required: false
         default: ''
@@ -20,10 +20,9 @@ jobs:
   validate:
     name: Run manual validation
     permissions:
+      checks: write
       contents: read
     uses: ./.github/workflows/validate_llamacpp_core.yml
     with:
       lite: ${{ inputs.lite }}
       models: ${{ inputs.models }}
-    secrets:
-      HUGGINGFACE_ACCESS_TOKEN: ${{ secrets.HUGGINGFACE_ACCESS_TOKEN }}

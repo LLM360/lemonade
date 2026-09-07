@@ -3,12 +3,16 @@ name: Validate llama.cpp
 on:
   workflow_call:
     inputs:
+      authorization_epoch:
+        description: 'Trusted authorization issue-event ID; zero outside pull requests'
+        type: string
+        default: '0'
       lite:
-        description: 'Run in lite mode (smallest model only)'
+        description: 'Run only the K2-Horizon 0.9B smoke model'
         type: boolean
         default: false
       models:
-        description: 'Optional comma-separated model IDs (empty uses hot models)'
+        description: 'Additional comma-separated IDs; empty uses hot models + K2 0.9B'
         type: string
         required: false
         default: ''
@@ -16,6 +20,8 @@ on:
       HUGGINGFACE_ACCESS_TOKEN:
         required: false
     outputs:
+      check_run_id:
+        value: ${{ jobs.validate-invocation.outputs.check_run_id }}
       promotion_eligible:
         value: ${{ jobs.plan.outputs.promotion_eligible }}
       validation_matrix:
@@ -58,6 +64,7 @@ permissions:
   contents: read
 
 env:
+  DEPENDABOT_PR: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.user.id == 49699333 && github.event.pull_request.user.type == 'Bot' }}
   LEMONADE_CI_MODE: "True"
   PYTHONIOENCODING: utf-8
 
@@ -65,6 +72,11 @@ jobs:
   validate-invocation:
     name: Validate invocation
     runs-on: ubuntu-latest
+    permissions:
+      checks: write
+      contents: read
+    outputs:
+      check_run_id: ${{ steps.start-check.outputs.check_run_id }}
     steps:
       - name: Reject untrusted caller events
         env:
@@ -81,6 +93,166 @@ jobs:
               ;;
           esac
 
+      - name: Start authorized merge check
+        id: start-check
+        if: (github.event_name == 'pull_request_target' || github.event_name == 'merge_group') && env.DEPENDABOT_PR != 'true'
+        env:
+          AUTHORIZATION_EPOCH: ${{ inputs.authorization_epoch }}
+          CHECK_NAME: llama.cpp authorized validation v2
+          EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          MERGE_SHA: ${{ github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.event.pull_request.merge_commit_sha }}
+          RUN_ATTEMPT: ${{ github.run_attempt }}
+          RUN_ID: ${{ github.run_id }}
+          RUN_NUMBER: ${{ github.run_number }}
+          TARGET_KEY: ${{ github.event_name == 'merge_group' && format('merge-group-{0}', github.event.merge_group.head_sha) || format('pr-{0}', github.event.pull_request.number) }}
+        run: |
+          set -euo pipefail
+          EXTERNAL_PREFIX="lemonade-llamacpp-required-${TARGET_KEY}-"
+          EXTERNAL_ID="${EXTERNAL_PREFIX}${AUTHORIZATION_EPOCH}-${RUN_NUMBER}-${RUN_ATTEMPT}-${RUN_ID}"
+          if ! [[ "$AUTHORIZATION_EPOCH" =~ ^[0-9]+$ ]] || \
+             ! [[ "$MERGE_SHA" =~ ^[0-9a-fA-F]{40}$ ]]; then
+            echo "::error::Protected validation requires an exact candidate commit."
+            exit 1
+          fi
+          if [ "$EVENT_NAME" = "pull_request_target" ] && \
+             ! [[ "$AUTHORIZATION_EPOCH" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Pull-request validation requires a live authorization epoch."
+            exit 1
+          fi
+          check_runs=$(gh api --method GET --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -f check_name="$CHECK_NAME" \
+            -f filter=all \
+            -F per_page=100)
+
+          IFS=$'\t' read -r newest_number newest_attempt < <(
+            jq -r --arg check_name "$CHECK_NAME" --arg external_prefix "$EXTERNAL_PREFIX" \
+              '[.[] | .check_runs[]?
+                | select(.name == $check_name and .app.slug == "github-actions")
+                | select((.external_id // "") | startswith($external_prefix))
+                | try ((.external_id | ltrimstr($external_prefix)
+                    | capture("^(?<epoch>[0-9]+)-(?<number>[0-9]+)-(?<attempt>[0-9]+)-(?<id>[0-9]+)$"))
+                    | {epoch: (.epoch | tonumber), number: (.number | tonumber),
+                       attempt: (.attempt | tonumber)}) catch empty]
+               | sort_by(.number, .attempt)
+               | (last // {epoch: 0, number: 0, attempt: 0})
+               | [.number, .attempt] | @tsv' <<<"$check_runs"
+          )
+          if [ "$newest_number" -gt "$RUN_NUMBER" ] || \
+             { [ "$newest_number" -eq "$RUN_NUMBER" ] && \
+               [ "$newest_attempt" -gt "$RUN_ATTEMPT" ]; }; then
+            echo "::error::A newer GitHub Actions validation run already owns this exact-commit gate."
+            exit 1
+          fi
+
+          check_run_id=$(jq -r --arg check_name "$CHECK_NAME" \
+            --arg external_id "$EXTERNAL_ID" \
+            '[.[] | .check_runs[]?
+              | select(.name == $check_name and .app.slug == "github-actions" and
+                  .external_id == $external_id)
+              | .id] | last // empty' <<<"$check_runs")
+
+          if [ -n "$check_run_id" ] && ! [[ "$check_run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Checks API returned an invalid existing check-run ID."
+            exit 1
+          fi
+          if [ -z "$check_run_id" ]; then
+            response=$(gh api --method POST "repos/${GITHUB_REPOSITORY}/check-runs" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f head_sha="$MERGE_SHA" \
+              -f external_id="$EXTERNAL_ID" \
+              -f status=in_progress \
+              -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}")
+            check_run_id=$(jq -r '.id // empty' <<<"$response")
+          else
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/check-runs/${check_run_id}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f status=in_progress \
+              -f details_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >/dev/null
+          fi
+          if ! [[ "$check_run_id" =~ ^[0-9]+$ ]]; then
+            echo "::error::Checks API returned an invalid check-run ID."
+            exit 1
+          fi
+
+          check_runs=$(gh api --method GET --paginate --slurp \
+            "repos/${GITHUB_REPOSITORY}/commits/${MERGE_SHA}/check-runs" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            -f check_name="$CHECK_NAME" \
+            -f filter=all \
+            -F per_page=100)
+          IFS=$'\t' read -r newest_number newest_attempt < <(
+            jq -r --arg check_name "$CHECK_NAME" --arg external_prefix "$EXTERNAL_PREFIX" \
+              '[.[] | .check_runs[]?
+                | select(.name == $check_name and .app.slug == "github-actions")
+                | select((.external_id // "") | startswith($external_prefix))
+                | try ((.external_id | ltrimstr($external_prefix)
+                    | capture("^(?<epoch>[0-9]+)-(?<number>[0-9]+)-(?<attempt>[0-9]+)-(?<id>[0-9]+)$"))
+                    | {epoch: (.epoch | tonumber), number: (.number | tonumber),
+                       attempt: (.attempt | tonumber)}) catch empty]
+               | sort_by(.number, .attempt)
+               | (last // {epoch: 0, number: 0, attempt: 0})
+               | [.number, .attempt] | @tsv' <<<"$check_runs"
+          )
+          if [ "$newest_number" -gt "$RUN_NUMBER" ] || \
+             { [ "$newest_number" -eq "$RUN_NUMBER" ] && \
+               [ "$newest_attempt" -gt "$RUN_ATTEMPT" ]; }; then
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/check-runs/${check_run_id}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f status=completed \
+              -f conclusion=cancelled \
+              -f "output[title]=$CHECK_NAME" \
+              -f "output[summary]=Superseded by a newer policy decision." >/dev/null
+            echo "::error::A newer GitHub Actions validation run superseded this check."
+            exit 1
+          fi
+
+          prior_check_ids=$(jq -r \
+            --arg check_name "$CHECK_NAME" \
+            --arg external_prefix "$EXTERNAL_PREFIX" \
+            --argjson current_number "$RUN_NUMBER" --argjson current_attempt "$RUN_ATTEMPT" \
+            '.[] | .check_runs[]?
+             | select(.name == $check_name and .app.slug == "github-actions")
+             | select((.external_id // "") | startswith($external_prefix))
+             | . as $check
+             | try (($check.external_id | ltrimstr($external_prefix)
+                 | capture("^(?<epoch>[0-9]+)-(?<number>[0-9]+)-(?<attempt>[0-9]+)-(?<id>[0-9]+)$"))
+                 | {epoch: (.epoch | tonumber), number: (.number | tonumber),
+                    attempt: (.attempt | tonumber)}) catch empty
+             | select(.number < $current_number or
+                 (.number == $current_number and .attempt < $current_attempt))
+             | $check.id' <<<"$check_runs")
+          while IFS= read -r prior_check_id; do
+            [ -n "$prior_check_id" ] || continue
+            if ! [[ "$prior_check_id" =~ ^[0-9]+$ ]]; then
+              echo "::error::Checks API returned an invalid prior check-run ID."
+              exit 1
+            fi
+            gh api --method PATCH \
+              "repos/${GITHUB_REPOSITORY}/check-runs/${prior_check_id}" \
+              -H "Accept: application/vnd.github+json" \
+              -H "X-GitHub-Api-Version: 2022-11-28" \
+              -f name="$CHECK_NAME" \
+              -f status=completed \
+              -f conclusion=cancelled \
+              -f "output[title]=$CHECK_NAME" \
+              -f "output[summary]=Superseded by a newer authorized validation run." >/dev/null
+          done <<<"$prior_check_ids"
+
+          echo "check_run_id=$check_run_id" >> "$GITHUB_OUTPUT"
+
   plan:
     name: Plan validation
     needs: validate-invocation
@@ -89,7 +261,7 @@ jobs:
       matrix: ${{ steps.protected-plan.outputs.matrix || steps.branch-plan.outputs.matrix }}
       promotion_eligible: ${{ steps.protected-plan.outputs.promotion_eligible || steps.branch-plan.outputs.promotion_eligible }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         if: github.event_name != 'pull_request_target' && github.event_name != 'merge_group'
         with:
           repository: ${{ github.repository }}
@@ -107,6 +279,8 @@ jobs:
                 target: "windows-vulkan",
                 backend: "vulkan",
                 channel: "",
+                managed_pin: "vulkan",
+                build_platform: "windows",
                 runner: ["self-hosted", "Windows", "128gb", "vulkan", "lemon-prod"],
                 models: [
                   "K2-Horizon-0.9B-GGUF",
@@ -118,9 +292,59 @@ jobs:
                 lite: false
               },
               {
-                target: "rocm-stable",
+                target: "linux-vulkan",
+                backend: "vulkan",
+                channel: "",
+                managed_pin: "vulkan",
+                build_platform: "linux",
+                runner: ["self-hosted", "Linux", "vulkan", "lemon-prod"],
+                models: ["K2-Horizon-0.9B-GGUF"],
+                capability_profile: "k2-horizon-v1",
+                capability_models: ["K2-Horizon-0.9B-GGUF"],
+                lite: false
+              },
+              {
+                target: "linux-cpu",
+                backend: "cpu",
+                channel: "",
+                managed_pin: "cpu",
+                build_platform: "linux",
+                runner: ["self-hosted", "Linux", "lemon-prod"],
+                models: ["K2-Horizon-0.9B-GGUF"],
+                capability_profile: "k2-horizon-v1",
+                capability_models: ["K2-Horizon-0.9B-GGUF"],
+                lite: false
+              },
+              {
+                target: "macos-metal",
+                backend: "metal",
+                channel: "",
+                managed_pin: "metal",
+                build_platform: "macos",
+                runner: ["macos-latest"],
+                models: ["K2-Horizon-0.9B-GGUF"],
+                capability_profile: "k2-horizon-v1",
+                capability_models: ["K2-Horizon-0.9B-GGUF"],
+                lite: false
+              },
+              {
+                target: "windows-cuda",
+                backend: "cuda",
+                channel: "",
+                managed_pin: "cuda",
+                build_platform: "windows",
+                runner: ["self-hosted", "Windows", "cuda", "lemon-prod"],
+                models: ["K2-Horizon-0.9B-GGUF"],
+                capability_profile: "k2-horizon-v1",
+                capability_models: ["K2-Horizon-0.9B-GGUF"],
+                lite: false
+              },
+              {
+                target: "windows-rocm-stable",
                 backend: "rocm",
                 channel: "stable",
+                managed_pin: "rocm-stable",
+                build_platform: "windows",
                 runner: ["self-hosted", "Windows", "stx-halo", "rocm", "lemon-prod"],
                 models: ["K2-Horizon-0.9B-GGUF"],
                 capability_profile: "k2-horizon-v1",
@@ -128,9 +352,11 @@ jobs:
                 lite: false
               },
               {
-                target: "rocm-nightly",
+                target: "windows-rocm-nightly",
                 backend: "rocm",
                 channel: "nightly",
+                managed_pin: "rocm-nightly",
+                build_platform: "windows",
                 runner: ["self-hosted", "Windows", "stx-halo", "rocm", "lemon-prod"],
                 models: ["K2-Horizon-0.9B-GGUF"],
                 capability_profile: "k2-horizon-v1",
@@ -231,7 +457,7 @@ jobs:
       cuda_available: ${{ steps.assets.outputs.cuda_available }}
       release_asset_manifest: ${{ steps.manifest.outputs.release_asset_manifest }}
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.sha }}
@@ -270,7 +496,8 @@ jobs:
           fi
           upstream_reference="refs/heads/${source_default_branch}"
           upstream_reference_head=$(gh api \
-            "repos/${source_repository}/commits/${source_default_branch}" --jq '.sha')
+            "repos/${source_repository}/commits/heads/${source_default_branch}" \
+            --jq '.sha')
           if ! [[ "$upstream_reference_head" =~ ^[0-9a-fA-F]{40}$ ]]; then
             echo "::error::Could not resolve ${upstream_reference} to a full commit."
             exit 1
@@ -283,7 +510,9 @@ jobs:
             local release_tag_commit publisher_claim_type
             local publisher_claimed_source_commit comparison_path
             local source_manifest_asset_id source_manifest_path
-            release_tag_commit=$(gh api "repos/${repository}/commits/${tag}" --jq '.sha')
+            local build_target_attestation_path
+            release_tag_commit=$(gh api \
+              "repos/${repository}/commits/tags/${tag}" --jq '.sha')
             if ! [[ "$release_tag_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
               echo "::error::Could not resolve ${repository} ${tag} to a release tag commit."
               exit 1
@@ -291,17 +520,21 @@ jobs:
             if [ "$repository" = "$source_repository" ]; then
               publisher_claim_type="source-release-tag"
               publisher_claimed_source_commit="$release_tag_commit"
+              build_target_attestation_path="${source_manifest_directory}/source-release-targets.json"
+              printf '[]\n' > "$build_target_attestation_path"
             else
               publisher_claim_type="immutable-source-manifest"
               source_manifest_asset_id=$(python -m test.utils.llamacpp_release_manifest \
                 --source-manifest-asset-id "$path" "$repository")
               source_manifest_path="${source_manifest_directory}/source-${source_manifest_asset_id}.json"
+              build_target_attestation_path="${source_manifest_path}.build-targets"
               gh api "repos/${repository}/releases/assets/${source_manifest_asset_id}" \
                 -H "Accept: application/octet-stream" |
                 head -c "$((source_manifest_max_bytes + 1))" > "$source_manifest_path"
               publisher_claimed_source_commit=$(python -m test.utils.llamacpp_release_manifest \
                 --validate-source-manifest "$source_manifest_path" "$path" \
-                "$repository" "$tag" "$release_tag_commit")
+                "$repository" "$tag" "$release_tag_commit" \
+                --build-target-attestation-output "$build_target_attestation_path")
             fi
             if ! [[ "$publisher_claimed_source_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
               echo "::error::${repository} ${tag} did not bind one full upstream source commit."
@@ -315,13 +548,15 @@ jobs:
               --require-upstream-ancestry "$comparison_path" "$source_repository" \
               "$publisher_claimed_source_commit" "$upstream_reference_head"
             jq \
+              --slurpfile build_target_attestations "$build_target_attestation_path" \
               --arg publisher_claim_type "$publisher_claim_type" \
               --arg publisher_claimed_source_commit "$publisher_claimed_source_commit" \
               --arg release_tag_commit "$release_tag_commit" \
               --arg source_repository "$source_repository" \
               --arg upstream_reference "$upstream_reference" \
               --arg upstream_reference_head "$upstream_reference_head" \
-              '.publisher_claim_type = $publisher_claim_type
+              '.build_target_attestations = $build_target_attestations[0]
+               | .publisher_claim_type = $publisher_claim_type
                | .publisher_claimed_source_commit = $publisher_claimed_source_commit
                | .release_tag_commit = $release_tag_commit
                | .source_repository = $source_repository
@@ -377,11 +612,20 @@ jobs:
 
           from test.utils.llamacpp_release_assets import (
               build_asset_requirements,
+              build_rocm_asset_target_requirements,
               evaluate_asset_group,
           )
 
-          def read_assets(path):
-              return set(Path(path).read_text(encoding="utf-8").splitlines())
+          def read_asset_metadata(path):
+              release = json.loads(Path(path).read_text(encoding="utf-8"))
+              asset_sizes = {}
+              for asset in release["assets"]:
+                  asset_sizes[asset["name"]] = asset["size"]
+              attested_targets = {
+                  attestation["name"]: attestation["build_targets"]
+                  for attestation in release.get("build_target_attestations", [])
+              }
+              return asset_sizes, attested_targets
 
           def update_outputs(values):
               github_output = os.environ.get("GITHUB_OUTPUT")
@@ -391,9 +635,14 @@ jobs:
                   for key, value in values.items():
                       out.write(f"{key}={value}\n")
 
-          def report_group(name, available_assets, backend_requirements):
+          def report_group(
+              name,
+              available_assets,
+              backend_requirements,
+              **evaluation_options,
+          ):
               update_backends, missing_by_backend = evaluate_asset_group(
-                  available_assets, backend_requirements
+                  available_assets, backend_requirements, **evaluation_options
               )
               for backend, required in backend_requirements.items():
                   missing = missing_by_backend[backend]
@@ -409,9 +658,9 @@ jobs:
           rocm_release = os.environ["ROCM_RELEASE"]
           lemonade_release = os.environ["LEMONADE_RELEASE"]
 
-          ggml_assets = read_assets("ggml_assets.txt")
-          rocm_assets = read_assets("rocm_assets.txt")
-          lemonade_assets = read_assets("lemonade_assets.txt")
+          ggml_assets, _ = read_asset_metadata("ggml_release.json")
+          rocm_assets, rocm_attested_targets = read_asset_metadata("rocm_release.json")
+          lemonade_assets, _ = read_asset_metadata("lemonade_release.json")
 
           with open("src/cpp/resources/backend_versions.json", encoding="utf-8") as f:
               versions = json.load(f)
@@ -422,12 +671,20 @@ jobs:
               lemonade_release=lemonade_release,
               backend_versions=versions,
           )
+          rocm_target_requirements = build_rocm_asset_target_requirements(
+              rocm_release=rocm_release,
+              backend_versions=versions,
+          )
 
           ggml_updates, ggml_missing = report_group(
               "ggml-org/llama.cpp", ggml_assets, requirements["ggml"]
           )
           rocm_updates, rocm_missing = report_group(
-              "lemonade-sdk/llamacpp-rocm", rocm_assets, requirements["rocm"]
+              "lemonade-sdk/llamacpp-rocm",
+              rocm_assets,
+              requirements["rocm"],
+              required_asset_targets=rocm_target_requirements,
+              attested_asset_targets=rocm_attested_targets,
           )
           lemonade_updates, lemonade_missing = report_group(
               "lemonade-sdk/llama.cpp", lemonade_assets, requirements["lemonade"]
@@ -464,15 +721,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out the protected candidate commit
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.event.merge_group.head_sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
           path: candidate
           persist-credentials: false
           fetch-depth: 1
       - name: Check out trusted validation tools
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
@@ -490,10 +748,24 @@ jobs:
           "$BASE_SHA" "$CANDIDATE_SHA"
 
   build:
-    name: Build
+    name: Build ${{ matrix.platform }}
     needs: [validate-invocation, get-latest-releases, verify-release-assets, verify-protected-release-manifest, plan]
     if: always() && !failure() && !cancelled()
-    runs-on: windows-latest
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      VALIDATION_CANDIDATE_ROOT: ${{ (github.event_name == 'pull_request_target' || github.event_name == 'merge_group') && format('{0}/candidate', github.workspace) || github.workspace }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows
+            runner: windows-latest
+          - platform: linux
+            runner: ubuntu-latest
+          - platform: macos
+            runner: macos-latest
     steps:
       - name: Prepare Windows runner for long paths and stale workspace caches
         if: runner.os == 'Windows'
@@ -508,43 +780,60 @@ jobs:
           }
 
 
-      - uses: actions/checkout@v5
+      - name: Check out validation control plane
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ github.repository }}
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.sha }}
           persist-credentials: false
           clean: true
-          fetch-depth: 0
+          fetch-depth: 2
+
+      - name: Check out the validation candidate
+        if: github.event_name == 'pull_request_target' || github.event_name == 'merge_group'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.event.merge_group.head_sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+          path: candidate
+          persist-credentials: false
+          clean: true
+          fetch-depth: 2
 
       - name: Verify authorized merge commit
         if: github.event_name == 'pull_request_target'
-        shell: PowerShell
+        shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          $ErrorActionPreference = "Stop"
-          if ((git rev-parse HEAD^1) -ne $env:BASE_SHA) {
-            throw "The merge commit does not contain the authorized base commit."
+          set -euo pipefail
+          test "$(git -C "$VALIDATION_CANDIDATE_ROOT" rev-parse HEAD^1)" = "$BASE_SHA" || {
+            echo "::error::The merge commit does not contain the authorized base commit."
+            exit 1
           }
-          if ((git rev-parse HEAD^2) -ne $env:HEAD_SHA) {
-            throw "The merge commit does not contain the authorized pull request head."
+          test "$(git -C "$VALIDATION_CANDIDATE_ROOT" rev-parse HEAD^2)" = "$HEAD_SHA" || {
+            echo "::error::The merge commit does not contain the authorized pull request head."
+            exit 1
           }
 
       - name: Verify merge-group commit
         if: github.event_name == 'merge_group'
-        shell: PowerShell
+        shell: bash
         env:
           MERGE_GROUP_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
-          $ErrorActionPreference = "Stop"
-          if ((git rev-parse HEAD) -ne $env:MERGE_GROUP_SHA) {
-            throw "The checkout does not match the authorized merge-group commit."
+          set -euo pipefail
+          test "$(git -C "$VALIDATION_CANDIDATE_ROOT" rev-parse HEAD)" = "$MERGE_GROUP_SHA" || {
+            echo "::error::The checkout does not match the authorized merge-group commit."
+            exit 1
           }
 
       - name: Update backend_versions.json
         if: needs.get-latest-releases.result == 'success'
-        shell: PowerShell
+        shell: bash
+        working-directory: ${{ env.VALIDATION_CANDIDATE_ROOT }}
         env:
           LLAMACPP_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_release }}
           LLAMACPP_ROCM_RELEASE: ${{ needs.get-latest-releases.outputs.llamacpp_rocm_release }}
@@ -553,9 +842,8 @@ jobs:
           LLAMACPP_ROCM_UPDATE_BACKENDS: ${{ needs.verify-release-assets.outputs.rocm_update_backends }}
           LLAMACPP_LEMONADE_UPDATE_BACKENDS: ${{ needs.verify-release-assets.outputs.lemonade_update_backends }}
         run: |
-          $ErrorActionPreference = "Stop"
-
-          $script = @'
+          set -euo pipefail
+          python - <<'PY'
           import json
           import os
           import re
@@ -601,12 +889,64 @@ jobs:
                   print(f"  llamacpp.{key}: {old} -> {new}")
           else:
               print("  none")
-          '@
+          PY
 
-          $script | python -
+      - name: Stage protected validation-only model catalog
+        if: github.event_name == 'pull_request_target' || github.event_name == 'merge_group'
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: |
+          set -euo pipefail
+          candidate_catalog="$GITHUB_WORKSPACE/candidate/src/cpp/resources/server_models.json"
+          python - "$GITHUB_WORKSPACE/candidate" "$candidate_catalog" <<'PY'
+          import os
+          import stat
+          import sys
+          from pathlib import Path
 
-      - name: Build lemond
+          candidate_root = Path(sys.argv[1]).resolve(strict=True)
+          catalog_path = Path(sys.argv[2])
+          resolved_catalog = catalog_path.resolve(strict=True)
+          try:
+              resolved_catalog.relative_to(candidate_root)
+          except ValueError as exc:
+              raise SystemExit("candidate catalog escapes its checkout") from exc
+          if not stat.S_ISREG(os.lstat(catalog_path).st_mode):
+              raise SystemExit("candidate catalog must be a regular file")
+          PY
+          python "$GITHUB_WORKSPACE/test/utils/validation_model_catalog.py" \
+            --base "$candidate_catalog" \
+            --overlay "$GITHUB_WORKSPACE/test/fixtures/llamacpp_validation_models.json" \
+            --output "$candidate_catalog"
+
+      - name: Stage branch validation-only model catalog
+        if: github.event_name != 'pull_request_target' && github.event_name != 'merge_group'
+        working-directory: ${{ env.VALIDATION_CANDIDATE_ROOT }}
+        run: >-
+          python -m test.utils.validation_model_catalog
+          --base src/cpp/resources/server_models.json
+          --overlay test/fixtures/llamacpp_validation_models.json
+          --output src/cpp/resources/server_models.json
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        shell: bash
+        working-directory: ${{ env.VALIDATION_CANDIDATE_ROOT }}
+        run: ./setup.sh
+
+      - name: Install macOS build dependencies
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v ninja >/dev/null 2>&1 || brew install ninja
+
+      - name: Build lemond on Windows
+        if: runner.os == 'Windows'
         shell: PowerShell
+        working-directory: ${{ env.VALIDATION_CANDIDATE_ROOT }}
         run: |
           $ErrorActionPreference = "Stop"
           Write-Host "Building Lemonade server binaries..." -ForegroundColor Cyan
@@ -626,13 +966,35 @@ jobs:
           }
           Write-Host "Build successful!" -ForegroundColor Green
 
-      - name: Upload build artifacts
-        uses: actions/upload-artifact@v7
+      - name: Build lemond on Linux or macOS
+        if: runner.os != 'Windows'
+        shell: bash
+        working-directory: ${{ env.VALIDATION_CANDIDATE_ROOT }}
+        run: |
+          set -euo pipefail
+          cmake --preset default -DBUILD_WEB_APP=OFF -DBUILD_TESTING=OFF
+          cmake --build --preset default --target lemond --parallel 2
+          test -x build/lemond
+          build/lemond --version
+
+      - name: Upload Windows build artifacts
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: llamacpp-build
+          name: llamacpp-build-${{ matrix.platform }}
           path: |
-            build/Release/
-            build/resources/
+            ${{ env.VALIDATION_CANDIDATE_ROOT }}/build/Release/
+            ${{ env.VALIDATION_CANDIDATE_ROOT }}/build/resources/
+          retention-days: 7
+
+      - name: Upload Linux or macOS build artifacts
+        if: runner.os != 'Windows'
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: llamacpp-build-${{ matrix.platform }}
+          path: |
+            ${{ env.VALIDATION_CANDIDATE_ROOT }}/build/lemond
+            ${{ env.VALIDATION_CANDIDATE_ROOT }}/build/resources/
           retention-days: 7
 
   # ========================================================================
@@ -643,12 +1005,16 @@ jobs:
     needs: [get-latest-releases, build, plan]
     if: always() && needs.build.result == 'success'
     runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    env:
+      VALIDATION_CANDIDATE_ROOT: ${{ (github.event_name == 'pull_request_target' || github.event_name == 'merge_group') && format('{0}/candidate', github.workspace) || github.workspace }}
     strategy:
       fail-fast: false
       matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     steps:
       - name: Capture Vulkan runner configuration
-        if: matrix.backend == 'vulkan'
+        if: matrix.backend == 'vulkan' && runner.os == 'Windows'
         shell: PowerShell
         run: |
           $ErrorActionPreference = "Continue"
@@ -810,11 +1176,28 @@ jobs:
           # Environment collection should never make validation fail.
           exit 0
 
+      - name: Capture Vulkan runner configuration on Linux
+        if: matrix.backend == 'vulkan' && runner.os == 'Linux'
+        shell: bash
+        run: |
+          set +e
+          output_directory="$RUNNER_TEMP/vulkan-runner-config"
+          mkdir -p "$output_directory"
+          uname -a > "$output_directory/system.txt"
+          if command -v vulkaninfo >/dev/null 2>&1; then
+            vulkaninfo --summary > "$output_directory/vulkaninfo-summary.txt" 2>&1
+            vulkaninfo > "$output_directory/vulkaninfo.txt" 2>&1
+          else
+            echo "vulkaninfo was not found in PATH." \
+              > "$output_directory/vulkaninfo-unavailable.txt"
+          fi
+          exit 0
+
       - name: Upload Vulkan runner configuration
         if: always() && matrix.backend == 'vulkan'
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
-          name: vulkan-runner-config
+          name: vulkan-runner-config-${{ matrix.target }}
           path: ${{ runner.temp }}/vulkan-runner-config/
           retention-days: 30
           if-no-files-found: warn
@@ -824,7 +1207,9 @@ jobs:
         shell: PowerShell
         run: |
           $ErrorActionPreference = "Stop"
-          $workspaceRoot = [IO.Path]::GetFullPath($env:GITHUB_WORKSPACE)
+          $workspaceRoot = [IO.Path]::GetFullPath(
+            $env:VALIDATION_CANDIDATE_ROOT
+          )
           $lemondPath = [IO.Path]::GetFullPath(
             (Join-Path $workspaceRoot "build\Release\lemond.exe")
           )
@@ -862,269 +1247,191 @@ jobs:
             }
           }
 
-      - uses: actions/checkout@v5
+      - name: Check out validation control plane
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ github.repository }}
-          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.event_name == 'merge_group' && github.event.merge_group.head_sha || github.sha }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event_name == 'merge_group' && github.event.merge_group.base_sha || github.sha }}
+          persist-credentials: false
+          clean: true
+          fetch-depth: 2
+
+      - name: Check out the validation candidate
+        if: github.event_name == 'pull_request_target' || github.event_name == 'merge_group'
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          repository: ${{ github.repository }}
+          ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.event.merge_group.head_sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
+          path: candidate
           persist-credentials: false
           clean: true
           fetch-depth: 2
 
       - name: Verify authorized merge commit
         if: github.event_name == 'pull_request_target'
-        shell: PowerShell
+        shell: bash
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
-          $ErrorActionPreference = "Stop"
-          if ((git rev-parse HEAD^1) -ne $env:BASE_SHA) {
-            throw "The merge commit does not contain the authorized base commit."
+          set -euo pipefail
+          test "$(git -C "$VALIDATION_CANDIDATE_ROOT" rev-parse HEAD^1)" = "$BASE_SHA" || {
+            echo "::error::The merge commit does not contain the authorized base commit."
+            exit 1
           }
-          if ((git rev-parse HEAD^2) -ne $env:HEAD_SHA) {
-            throw "The merge commit does not contain the authorized pull request head."
+          test "$(git -C "$VALIDATION_CANDIDATE_ROOT" rev-parse HEAD^2)" = "$HEAD_SHA" || {
+            echo "::error::The merge commit does not contain the authorized pull request head."
+            exit 1
           }
 
       - name: Verify merge-group commit
         if: github.event_name == 'merge_group'
-        shell: PowerShell
+        shell: bash
         env:
           MERGE_GROUP_SHA: ${{ github.event.merge_group.head_sha }}
         run: |
-          $ErrorActionPreference = "Stop"
-          if ((git rev-parse HEAD) -ne $env:MERGE_GROUP_SHA) {
-            throw "The checkout does not match the authorized merge-group commit."
+          set -euo pipefail
+          test "$(git -C "$VALIDATION_CANDIDATE_ROOT" rev-parse HEAD)" = "$MERGE_GROUP_SHA" || {
+            echo "::error::The checkout does not match the authorized merge-group commit."
+            exit 1
           }
 
       - name: Cleanup processes
+        if: runner.os == 'Windows'
         uses: ./.github/actions/cleanup-processes-windows
 
-      - name: Download build artifacts
-        uses: actions/download-artifact@v7
-        with:
-          name: llamacpp-build
-          path: build
+      - name: Cleanup processes on Linux
+        if: runner.os == 'Linux'
+        uses: ./.github/actions/cleanup-processes-linux
 
-      - name: Verify binaries
+      - name: Download build artifacts
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: llamacpp-build-${{ matrix.build_platform }}
+          path: ${{ env.VALIDATION_CANDIDATE_ROOT }}/build
+
+      - name: Verify Windows binary artifact
+        if: runner.os == 'Windows'
         shell: PowerShell
         run: |
-          $lemondExe = "build\Release\lemond.exe"
+          $lemondExe = Join-Path `
+            $env:VALIDATION_CANDIDATE_ROOT "build\Release\lemond.exe"
           if (-not (Test-Path $lemondExe)) {
               Write-Host "ERROR: lemond.exe not found!" -ForegroundColor Red
-              Get-ChildItem -Recurse build | Select-Object FullName
+              Get-ChildItem -Recurse `
+                (Join-Path $env:VALIDATION_CANDIDATE_ROOT "build") |
+                Select-Object FullName
               exit 1
           }
-          & $lemondExe --version
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          Write-Host "Binaries verified!" -ForegroundColor Green
+          if ((Get-Item $lemondExe).Attributes -band `
+              [IO.FileAttributes]::ReparsePoint) {
+              Write-Host "ERROR: lemond.exe must not be a link!" `
+                -ForegroundColor Red
+              exit 1
+          }
+          Write-Host "Binary artifact verified!" -ForegroundColor Green
 
-      - name: Setup Python and virtual environment
+      - name: Verify Linux or macOS binary artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          lemond="$VALIDATION_CANDIDATE_ROOT/build/lemond"
+          test -f "$lemond"
+          test ! -L "$lemond"
+          chmod +x "$lemond"
+
+      - name: Set up trusted or branch validation environment
+        id: validation-venv
         uses: ./.github/actions/setup-venv
         with:
           venv-name: '.venv'
           python-version: '3.10'
-          requirements-file: 'test/requirements.txt'
+          requirements-file: '${{ github.workspace }}/test/requirements.txt'
 
       - name: Run validation with lemond
-        shell: PowerShell
+        id: run-validation
         env:
           CAPABILITY_MODELS: ${{ join(matrix.capability_models || fromJSON('[]'), ',') }}
           CAPABILITY_PROFILE: ${{ matrix.capability_profile || '' }}
-          HF_TOKEN: ${{ github.event_name != 'pull_request_target' && github.event_name != 'merge_group' && secrets.HUGGINGFACE_ACCESS_TOKEN || '' }}
+          CANDIDATE_LEMOND: ${{ runner.os == 'Windows' && format('{0}/build/Release/lemond.exe', env.VALIDATION_CANDIDATE_ROOT) || format('{0}/build/lemond', env.VALIDATION_CANDIDATE_ROOT) }}
+          HF_TOKEN: ${{ github.event_name == 'schedule' && secrets.HUGGINGFACE_ACCESS_TOKEN || '' }}
+          HUGGINGFACE_TOKEN: ''
+          HUGGING_FACE_HUB_TOKEN: ''
+          LLAMACPP_BACKEND: ${{ matrix.backend }}
+          LLAMACPP_CHANNEL: ${{ matrix.channel }}
           LLAMACPP_TEST_MODELS: ${{ join(matrix.models, ',') }}
           LITE_MODE: ${{ matrix.lite }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          $port = 13305
-          $lemondExe = (Resolve-Path "build\Release\lemond.exe").Path
-          $backend = "${{ matrix.backend }}"
-          $channel = "${{ matrix.channel }}"
-          $label = "${{ matrix.target }}"
-          $logsDir = "server-logs-$label"
-          $cacheDir = Join-Path $PWD "ci-cache-$label"
-          $cachePrefix = [IO.Path]::GetFullPath($cacheDir)
-          $separator = [string][IO.Path]::DirectorySeparatorChar
-          if (-not $cachePrefix.EndsWith($separator)) { $cachePrefix += $separator }
-          $venvPython = ".\.venv\Scripts\python.exe"
-          $tempRoot = if ($env:RUNNER_TEMP) { $env:RUNNER_TEMP } else { $PWD }
-          $pidFile = Join-Path $tempRoot "lemond-validate-llamacpp.pid"
-
-          function Get-ValidationLlamaServers {
-            Get-CimInstance Win32_Process `
-              -Filter "Name = 'llama-server.exe'" `
-              -ErrorAction SilentlyContinue | Where-Object {
-                $_.ExecutablePath -and $_.ExecutablePath.StartsWith(
-                  $cachePrefix,
-                  [StringComparison]::OrdinalIgnoreCase
-                )
-              }
-          }
-
-          New-Item -ItemType Directory -Force -Path $logsDir | Out-Null
-          New-Item -ItemType Directory -Force -Path $cacheDir | Out-Null
-
-          $stdoutLog = Join-Path $PWD "$logsDir\lemond.stdout.log"
-          $stderrLog = Join-Path $PWD "$logsDir\lemond.stderr.log"
-
-          # Do not benchmark while another known inference process is active.
-          $conflicts = @(
-            Get-Process -Name @(
-              "lemond", "llama-server", "lemonade", "LemonadeServer",
-              "flm", "ort-server", "moonshine-server"
-            ) -ErrorAction SilentlyContinue
-          )
-          if ($conflicts.Count -gt 0) {
-            $details = ($conflicts | ForEach-Object {
-              "$($_.ProcessName):$($_.Id)"
-            }) -join ", "
-            throw "Runner is not idle: $details"
-          }
-
-          if (Get-NetTCPConnection -State Listen -LocalPort $port -ErrorAction SilentlyContinue) {
-            throw "Port $port is already in use."
-          }
-
-          $proc = $null
-          $validationExitCode = 0
-          $cleanupExitCode = 0
-
-          try {
-            $proc = Start-Process `
-              -FilePath $lemondExe `
-              -ArgumentList @($cacheDir, "--port", $port, "--host", "127.0.0.1") `
-              -RedirectStandardOutput $stdoutLog `
-              -RedirectStandardError $stderrLog `
-              -PassThru
-
-            # Same-job fallback for the existing final cleanup action.
-            Set-Content -Path $pidFile -Value $proc.Id -Encoding ASCII
-            Write-Host "Started lemond PID $($proc.Id)" -ForegroundColor Cyan
-
-            if ($proc.WaitForExit(500)) {
-              throw "lemond exited before validation started. See $stderrLog."
-            }
-
-            $validationArgs = @(
-              "test/validate_llamacpp.py",
-              "--backend", $backend,
-              "--port", $port,
-              "--output", "llamacpp_validation_$label.json",
-              "--logs-dir", $logsDir
-            )
-
-            if ($channel) {
-              $validationArgs += "--channel"
-              $validationArgs += $channel
-            }
-
-            . ".github/scripts/llamacpp_validation_args.ps1"
-            $validationArgs += @(Get-LlamaCppValidationModelArguments `
-              -Models $env:LLAMACPP_TEST_MODELS `
-              -Lite ($env:LITE_MODE -eq "true") `
-              -CapabilityProfile $env:CAPABILITY_PROFILE `
-              -CapabilityModels $env:CAPABILITY_MODELS)
-
-            & $venvPython @validationArgs
-            $validationExitCode = $LASTEXITCODE
-          } finally {
-            if ($null -ne $proc) {
-              if ($proc.HasExited) {
-                $cleanupExitCode = 1
-                Write-Warning "lemond exited before graceful shutdown."
-              }
-              try {
-                if (-not $proc.HasExited) {
-                  Invoke-WebRequest -Uri "http://127.0.0.1:$port/internal/shutdown" `
-                    -Method POST -TimeoutSec 10 -UseBasicParsing | Out-Null
-                  $null = $proc.WaitForExit(10000)
-                }
-              } catch {
-                $cleanupExitCode = 1
-                Write-Host "Graceful shutdown failed; forcing targeted cleanup." `
-                  -ForegroundColor Yellow
-              }
-
-              if (-not $proc.HasExited) {
-                $cleanupExitCode = 1
-                Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                $null = $proc.WaitForExit(5000)
-              }
-
-              # Catch a llama-server orphan even if its lemond parent exited first.
-              $orphans = @(Get-ValidationLlamaServers)
-              if ($orphans.Count -gt 0) {
-                $cleanupExitCode = 1
-              }
-              foreach ($orphan in $orphans) {
-                Write-Host "Stopping validation llama-server PID $($orphan.ProcessId)." `
-                  -ForegroundColor Yellow
-                Stop-Process -Id $orphan.ProcessId -Force -ErrorAction SilentlyContinue
-              }
-
-              # Process teardown can lag slightly on Windows, especially after
-              # releasing Vulkan resources. Give it a short bounded grace period.
-              $remainingOrphans = @(Get-ValidationLlamaServers)
-              $cleanupDeadline = (Get-Date).AddSeconds(5)
-
-              while (
-                $remainingOrphans.Count -gt 0 -and
-                (Get-Date) -lt $cleanupDeadline
-              ) {
-                Start-Sleep -Milliseconds 500
-                $remainingOrphans = @(Get-ValidationLlamaServers)
-              }
-
-              if ($proc.HasExited -and $remainingOrphans.Count -eq 0) {
-                Remove-Item $pidFile -Force -ErrorAction SilentlyContinue
-              } else {
-                $cleanupExitCode = 1
-                if (-not $proc.HasExited) {
-                  Write-Warning "lemond PID $($proc.Id) is still running after cleanup."
-                }
-
-                foreach ($orphan in $remainingOrphans) {
-                  Write-Warning (
-                    "llama-server still present after cleanup: " +
-                    "PID=$($orphan.ProcessId), Path=$($orphan.ExecutablePath)"
-                  )
-                }
-
-                Write-Warning (
-                  "Validation cleanup did not fully complete. " +
-                  "The validation result will be preserved."
-                )
-              }
-            }
-          }
-
-          if ($validationExitCode -ne 0) {
-            exit $validationExitCode
-          }
-          if ($cleanupExitCode -ne 0) {
-            exit $cleanupExitCode
-          }
+          LEMONADE_PROTECTED_RUNNER_CONTEXT: ${{ matrix.target == 'macos-metal' && runner.environment == 'github-hosted' && join(matrix.runner, ',') == 'macos-latest' && 'github-hosted:macos-latest:macos-metal' || '' }}
+          PYTHONPATH: ${{ github.workspace }}
+          TARGET: "${{ matrix.target }}"
+          VALIDATION_ROOT: ${{ github.workspace }}
+        shell: bash
+        working-directory: ${{ github.workspace }}
+        run: >-
+          python "$VALIDATION_ROOT/.github/scripts/run_llamacpp_validation.py"
+          --lemond "$CANDIDATE_LEMOND"
+          --python "${{ steps.validation-venv.outputs.python-path }}"
+          ${{ github.event_name == 'schedule' && '--allow-huggingface-download-credentials' || '' }}
+          ${{ matrix.target == 'macos-metal' && runner.environment == 'github-hosted' && join(matrix.runner, ',') == 'macos-latest' && '--allow-darwin-github-hosted-ephemeral-runner' || '' }}
 
       - name: Upload results
-        if: always()
-        uses: actions/upload-artifact@v7
+        if: >-
+          steps.run-validation.outcome == 'success' &&
+          !((github.event_name == 'pull_request_target' || github.event_name == 'merge_group') &&
+          matrix.target == 'macos-metal' && runner.environment == 'github-hosted' &&
+          join(matrix.runner, ',') == 'macos-latest')
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: validation-results-${{ matrix.target }}
-          path: llamacpp_validation_${{ matrix.target }}.json
+          path: ${{ steps.run-validation.outputs.validation_result }}
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload restart results
+        if: >-
+          steps.run-validation.outcome == 'success' &&
+          !((github.event_name == 'pull_request_target' || github.event_name == 'merge_group') &&
+          matrix.target == 'macos-metal' && runner.environment == 'github-hosted' &&
+          join(matrix.runner, ',') == 'macos-latest')
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
+        with:
+          name: restart-validation-results-${{ matrix.target }}
+          path: ${{ steps.run-validation.outputs.restart_result }}
           retention-days: 30
           if-no-files-found: error
 
       - name: Upload server logs
-        if: always()
-        uses: actions/upload-artifact@v7
+        if: >-
+          steps.run-validation.outcome == 'success' &&
+          !((github.event_name == 'pull_request_target' || github.event_name == 'merge_group') &&
+          matrix.target == 'macos-metal' && runner.environment == 'github-hosted' &&
+          join(matrix.runner, ',') == 'macos-latest')
+        uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f # v7.0.0
         with:
           name: server-logs-${{ matrix.target }}
-          path: server-logs-${{ matrix.target }}/
+          path: |
+            ${{ steps.run-validation.outputs.prepare_stdout_log }}
+            ${{ steps.run-validation.outputs.prepare_stderr_log }}
+            ${{ steps.run-validation.outputs.validation_stdout_log }}
+            ${{ steps.run-validation.outputs.validation_stderr_log }}
+            ${{ steps.run-validation.outputs.restart_stdout_log }}
+            ${{ steps.run-validation.outputs.restart_stderr_log }}
           retention-days: 30
-          if-no-files-found: ignore
+          if-no-files-found: error
 
       - name: Cleanup
-        if: always()
+        if: >-
+          always() && runner.os == 'Windows' &&
+          github.event_name != 'pull_request_target' && github.event_name != 'merge_group'
         uses: ./.github/actions/cleanup-processes-windows
+
+      - name: Cleanup on Linux
+        if: >-
+          always() && runner.os == 'Linux' &&
+          github.event_name != 'pull_request_target' && github.event_name != 'merge_group'
+        uses: ./.github/actions/cleanup-processes-linux
 
   reverify-protected-release-manifest:
     name: Reverify protected release manifest
@@ -1140,16 +1447,17 @@ jobs:
         run: echo "This invocation does not review a protected pin change."
       - name: Check out the protected candidate commit
         if: github.event_name == 'pull_request_target' || github.event_name == 'merge_group'
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.merge_commit_sha || github.event.merge_group.head_sha }}
+          allow-unsafe-pr-checkout: ${{ github.event_name == 'pull_request_target' }}
           path: candidate
           persist-credentials: false
           fetch-depth: 1
       - name: Check out trusted validation tools
         if: github.event_name == 'pull_request_target' || github.event_name == 'merge_group'
-        uses: actions/checkout@v5
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           repository: ${{ github.repository }}
           ref: ${{ github.event_name == 'pull_request_target' && github.event.pull_request.base.sha || github.event.merge_group.base_sha }}

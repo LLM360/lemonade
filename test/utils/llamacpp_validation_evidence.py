@@ -5,7 +5,10 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import os
 import re
+import stat
 from pathlib import Path
 
 if __package__:
@@ -14,19 +17,33 @@ if __package__:
         CapabilityValidationError,
         validate_capability_matrix_evidence,
     )
+    from .llamacpp_validation_plan import (
+        K2_LARGE,
+        K2_MEDIUM,
+        K2_SMALL,
+        VALIDATION_LANES,
+        require_complete_promotion_coverage,
+    )
 else:
     from llamacpp_capability_validation import (  # type: ignore[import-not-found]
         K2_HORIZON_PROFILE,
         CapabilityValidationError,
         validate_capability_matrix_evidence,
     )
+    from llamacpp_validation_plan import (  # type: ignore[import-not-found]
+        K2_LARGE,
+        K2_MEDIUM,
+        K2_SMALL,
+        VALIDATION_LANES,
+        require_complete_promotion_coverage,
+    )
 
-EXPECTED_RESULT_FILES = (
-    "llamacpp_validation_windows-vulkan.json",
-    "llamacpp_validation_rocm-stable.json",
-    "llamacpp_validation_rocm-nightly.json",
+EXPECTED_RESULT_FILES = tuple(
+    f"llamacpp_validation_{lane['target']}.json" for lane in VALIDATION_LANES
 )
-K2_SMALL = "K2-Horizon-0.9B-GGUF"
+EXPECTED_RESTART_RESULT_FILES = tuple(
+    f"llamacpp_restart_validation_{lane['target']}.json" for lane in VALIDATION_LANES
+)
 REQUIRED_RESULT_FIELDS = {
     "model",
     "pass",
@@ -36,6 +53,8 @@ REQUIRED_RESULT_FIELDS = {
     "time_to_first_token",
     "tokens_per_second",
 }
+MAX_VALIDATION_EVIDENCE_BYTES = 4 * 1024 * 1024
+_EVIDENCE_READ_CHUNK_BYTES = 64 * 1024
 
 
 class ValidationEvidenceError(ValueError):
@@ -51,9 +70,26 @@ def _unique_json_object(pairs: list[tuple[str, object]]) -> dict:
     return result
 
 
+def _reject_json_constant(value: str) -> None:
+    raise ValidationEvidenceError(f"nonstandard JSON numeric constant: {value}")
+
+
+def _parse_finite_float(value: str) -> float:
+    parsed = float(value)
+    if not math.isfinite(parsed):
+        raise ValidationEvidenceError(f"non-finite JSON number: {value}")
+    return parsed
+
+
 def _validate_record(filename: str, index: int, record: object) -> dict:
     if not isinstance(record, dict):
         raise ValidationEvidenceError(f"{filename}: result {index} must be an object")
+    unexpected_fields = set(record) - REQUIRED_RESULT_FIELDS - {"capability_matrix"}
+    if unexpected_fields:
+        raise ValidationEvidenceError(
+            f"{filename}: result {index} has unexpected fields: "
+            + ", ".join(sorted(unexpected_fields))
+        )
     missing_fields = REQUIRED_RESULT_FIELDS - set(record)
     if missing_fields:
         raise ValidationEvidenceError(
@@ -94,6 +130,7 @@ def _validate_record(filename: str, index: int, record: object) -> dict:
                 isinstance(value, (int, float))
                 and not isinstance(value, bool)
                 and value >= 0
+                and (isinstance(value, int) or math.isfinite(value))
             )
         ):
             raise ValidationEvidenceError(
@@ -106,9 +143,205 @@ def _canonical_model_id(model_id: str) -> str:
     return model_id.removeprefix("builtin.")
 
 
+def _stat_snapshot(status: os.stat_result) -> tuple[int, int, int, int, int, int]:
+    return (
+        status.st_dev,
+        status.st_ino,
+        status.st_mode,
+        status.st_size,
+        status.st_mtime_ns,
+        status.st_ctime_ns,
+    )
+
+
+def _read_bounded_result_file(path: Path) -> str:
+    filename = path.name
+    try:
+        path_status = os.stat(path, follow_symlinks=False)
+    except FileNotFoundError as exc:
+        raise ValidationEvidenceError(f"missing validation result: {filename}") from exc
+    except OSError as exc:
+        raise ValidationEvidenceError(f"could not read {filename}: {exc}") from exc
+    if not stat.S_ISREG(path_status.st_mode):
+        raise ValidationEvidenceError(
+            f"validation result must be a regular file: {filename}"
+        )
+
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as exc:
+        raise ValidationEvidenceError(f"could not read {filename}: {exc}") from exc
+
+    try:
+        opened_status = os.fstat(descriptor)
+        if not stat.S_ISREG(opened_status.st_mode):
+            raise ValidationEvidenceError(
+                f"validation result must be a regular file: {filename}"
+            )
+        if (opened_status.st_dev, opened_status.st_ino) != (
+            path_status.st_dev,
+            path_status.st_ino,
+        ):
+            raise ValidationEvidenceError(
+                f"validation result changed before reading: {filename}"
+            )
+        if opened_status.st_size > MAX_VALIDATION_EVIDENCE_BYTES:
+            raise ValidationEvidenceError(
+                f"validation result exceeds byte limit: {filename}"
+            )
+
+        chunks = []
+        total_bytes = 0
+        while total_bytes <= MAX_VALIDATION_EVIDENCE_BYTES:
+            chunk = os.read(
+                descriptor,
+                min(
+                    _EVIDENCE_READ_CHUNK_BYTES,
+                    MAX_VALIDATION_EVIDENCE_BYTES + 1 - total_bytes,
+                ),
+            )
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total_bytes += len(chunk)
+        final_status = os.fstat(descriptor)
+    except ValidationEvidenceError:
+        raise
+    except OSError as exc:
+        raise ValidationEvidenceError(f"could not read {filename}: {exc}") from exc
+    finally:
+        os.close(descriptor)
+
+    if total_bytes > MAX_VALIDATION_EVIDENCE_BYTES:
+        raise ValidationEvidenceError(
+            f"validation result exceeds byte limit: {filename}"
+        )
+    if _stat_snapshot(opened_status) != _stat_snapshot(final_status):
+        raise ValidationEvidenceError(
+            f"validation result changed while reading: {filename}"
+        )
+    if total_bytes != final_status.st_size:
+        raise ValidationEvidenceError(
+            f"validation result size changed while reading: {filename}"
+        )
+    try:
+        final_path_status = os.stat(path, follow_symlinks=False)
+    except OSError as exc:
+        raise ValidationEvidenceError(
+            f"validation result changed while reading: {filename}"
+        ) from exc
+    if not stat.S_ISREG(final_path_status.st_mode) or (
+        final_path_status.st_dev,
+        final_path_status.st_ino,
+    ) != (final_status.st_dev, final_status.st_ino):
+        raise ValidationEvidenceError(
+            f"validation result changed while reading: {filename}"
+        )
+    try:
+        return b"".join(chunks).decode("utf-8")
+    except UnicodeError as exc:
+        raise ValidationEvidenceError(f"could not read {filename}: {exc}") from exc
+
+
+def load_and_validate_result_file(
+    path: Path,
+    expected_models: list[str],
+    *,
+    capability_profile: str = "",
+    capability_models: list[str] | None = None,
+) -> list[dict]:
+    filename = path.name
+    if (
+        not expected_models
+        or not all(isinstance(model, str) and model for model in expected_models)
+        or len({_canonical_model_id(model) for model in expected_models})
+        != len(expected_models)
+    ):
+        raise ValidationEvidenceError(
+            f"{filename}: expected models must be unique nonempty model identifiers"
+        )
+    expected_capability_models = capability_models or []
+    if bool(capability_profile) != bool(expected_capability_models):
+        raise ValidationEvidenceError(
+            f"{filename}: capability profile and models must be paired"
+        )
+    canonical_expected_models = [
+        _canonical_model_id(model) for model in expected_models
+    ]
+    canonical_capability_models = {
+        _canonical_model_id(model) for model in expected_capability_models
+    }
+    if len(canonical_capability_models) != len(expected_capability_models):
+        raise ValidationEvidenceError(f"{filename}: capability models must be unique")
+    if not canonical_capability_models.issubset(canonical_expected_models):
+        raise ValidationEvidenceError(f"{filename}: capability models must be selected")
+    raw = _read_bounded_result_file(path)
+    if not raw.strip():
+        raise ValidationEvidenceError(f"validation result is empty: {filename}")
+    try:
+        records = json.loads(
+            raw,
+            object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_float,
+        )
+    except json.JSONDecodeError as exc:
+        raise ValidationEvidenceError(
+            f"validation result is invalid JSON: {filename}: {exc}"
+        ) from exc
+    if not isinstance(records, list) or not records:
+        raise ValidationEvidenceError(
+            f"validation result must be a nonempty array: {filename}"
+        )
+    checked = [
+        _validate_record(filename, index, record)
+        for index, record in enumerate(records)
+    ]
+    models = [record["model"] for record in checked]
+    canonical_models = [_canonical_model_id(model) for model in models]
+    if len(canonical_models) != len(set(canonical_models)):
+        raise ValidationEvidenceError(
+            f"validation result contains duplicate models: {filename}"
+        )
+    if canonical_models != canonical_expected_models:
+        raise ValidationEvidenceError(
+            f"{filename}: result models do not match planned models"
+        )
+    for record, model_id in zip(checked, canonical_models):
+        if model_id not in canonical_capability_models:
+            if "capability_matrix" in record:
+                raise ValidationEvidenceError(
+                    f"{filename}: {record['model']} has an unexpected capability matrix"
+                )
+            continue
+        if "capability_matrix" not in record:
+            raise ValidationEvidenceError(
+                f"{filename}: {record['model']} is missing capability evidence"
+            )
+        try:
+            validate_capability_matrix_evidence(
+                record["capability_matrix"],
+                capability_profile,
+                record["model"],
+            )
+        except CapabilityValidationError as exc:
+            raise ValidationEvidenceError(
+                f"{filename}: {record['model']} capability evidence is invalid: {exc}"
+            ) from exc
+    return checked
+
+
 def _expected_models_by_file(expected_matrix: object) -> dict[str, dict]:
     if not isinstance(expected_matrix, dict):
         raise ValidationEvidenceError("validation matrix must be an object")
+    try:
+        require_complete_promotion_coverage(expected_matrix)
+    except ValueError as exc:
+        raise ValidationEvidenceError(
+            f"invalid scheduled validation lanes: {exc}"
+        ) from exc
     rows = expected_matrix.get("include")
     if not isinstance(rows, list):
         raise ValidationEvidenceError("validation matrix include must be an array")
@@ -133,9 +366,14 @@ def _expected_models_by_file(expected_matrix: object) -> dict[str, dict]:
         filename = f"llamacpp_validation_{target}.json"
         if filename in expected:
             raise ValidationEvidenceError(f"duplicate validation lane: {target}")
-        if row.get("models") != []:
+        selected_models = row.get("models")
+        if (
+            not isinstance(selected_models, list)
+            or not all(isinstance(model, str) and model for model in selected_models)
+            or len(selected_models) != len(set(selected_models))
+        ):
             raise ValidationEvidenceError(
-                f"scheduled validation lane {target} must keep runtime hot selection"
+                f"validation matrix lane {target} needs unique selected models"
             )
         models = row.get("expected_models")
         if (
@@ -147,7 +385,11 @@ def _expected_models_by_file(expected_matrix: object) -> dict[str, dict]:
             raise ValidationEvidenceError(
                 f"validation matrix lane {target} needs unique expected models"
             )
-        if K2_SMALL not in models:
+        if selected_models != models:
+            raise ValidationEvidenceError(
+                f"validation matrix lane {target} selected and expected models differ"
+            )
+        if not any(_canonical_model_id(model) == K2_SMALL for model in models):
             raise ValidationEvidenceError(
                 f"validation matrix lane {target} must include {K2_SMALL}"
             )
@@ -176,7 +418,11 @@ def _expected_models_by_file(expected_matrix: object) -> dict[str, dict]:
             raise ValidationEvidenceError(
                 f"validation matrix lane {target} needs unique capability models"
             )
-        if any(model not in models for model in capability_models):
+        canonical_models = {_canonical_model_id(model) for model in models}
+        if any(
+            _canonical_model_id(model) not in canonical_models
+            for model in capability_models
+        ):
             raise ValidationEvidenceError(
                 f"validation matrix lane {target} has an unselected capability model"
             )
@@ -184,30 +430,23 @@ def _expected_models_by_file(expected_matrix: object) -> dict[str, dict]:
             raise ValidationEvidenceError(
                 f"validation matrix lane {target} must validate {K2_SMALL} capabilities"
             )
+        if any(
+            _canonical_model_id(model) in {K2_MEDIUM, K2_LARGE} for model in models
+        ) and (target != "windows-vulkan" or "128gb" not in row["runner"]):
+            raise ValidationEvidenceError(
+                f"validation matrix lane {target} needs the 128gb Vulkan runner "
+                "for K2-Horizon-3.7B/7B"
+            )
         expected[filename] = {
             "models": models,
             "capability_profile": capability_profile,
             "capability_models": capability_models,
+            "restart_model": capability_models[0],
         }
 
     if set(expected) != set(EXPECTED_RESULT_FILES):
         raise ValidationEvidenceError(
             "validation matrix must contain exactly the scheduled validation lanes"
-        )
-    planned_model_lists = [lane["models"] for lane in expected.values()]
-    if any(models != planned_model_lists[0] for models in planned_model_lists[1:]):
-        raise ValidationEvidenceError(
-            "scheduled validation lanes must use the same planned model set"
-        )
-    planned_capability_models = [
-        lane["capability_models"] for lane in expected.values()
-    ]
-    if any(
-        models != planned_capability_models[0]
-        for models in planned_capability_models[1:]
-    ):
-        raise ValidationEvidenceError(
-            "scheduled validation lanes must use the same capability model set"
         )
     return expected
 
@@ -219,66 +458,20 @@ def load_and_validate_results(
     expected_lanes = _expected_models_by_file(expected_matrix)
     validated = {}
     for filename in EXPECTED_RESULT_FILES:
-        path = root / filename
-        if not path.is_file():
-            raise ValidationEvidenceError(f"missing validation result: {filename}")
-        try:
-            raw = path.read_text(encoding="utf-8")
-        except OSError as exc:
-            raise ValidationEvidenceError(f"could not read {filename}: {exc}") from exc
-        if not raw.strip():
-            raise ValidationEvidenceError(f"validation result is empty: {filename}")
-        try:
-            records = json.loads(raw, object_pairs_hook=_unique_json_object)
-        except json.JSONDecodeError as exc:
-            raise ValidationEvidenceError(
-                f"validation result is invalid JSON: {filename}: {exc}"
-            ) from exc
-        if not isinstance(records, list) or not records:
-            raise ValidationEvidenceError(
-                f"validation result must be a nonempty array: {filename}"
-            )
-        checked = [
-            _validate_record(filename, index, record)
-            for index, record in enumerate(records)
-        ]
-        models = [record["model"] for record in checked]
-        if len(models) != len(set(models)):
-            raise ValidationEvidenceError(
-                f"validation result contains duplicate models: {filename}"
-            )
         expected_lane = expected_lanes[filename]
-        if models != expected_lane["models"]:
-            raise ValidationEvidenceError(
-                f"{filename}: result models do not match planned models"
-            )
-        capability_models = {
-            _canonical_model_id(model) for model in expected_lane["capability_models"]
-        }
-        for record in checked:
-            model_id = _canonical_model_id(record["model"])
-            if model_id not in capability_models:
-                if "capability_matrix" in record:
-                    raise ValidationEvidenceError(
-                        f"{filename}: {record['model']} has an unexpected capability matrix"
-                    )
-                continue
-            if "capability_matrix" not in record:
-                raise ValidationEvidenceError(
-                    f"{filename}: {record['model']} is missing capability evidence"
-                )
-            capability_matrix = record["capability_matrix"]
-            try:
-                validate_capability_matrix_evidence(
-                    capability_matrix,
-                    expected_lane["capability_profile"],
-                    record["model"],
-                )
-            except CapabilityValidationError as exc:
-                raise ValidationEvidenceError(
-                    f"{filename}: {record['model']} capability evidence is invalid: {exc}"
-                ) from exc
-        validated[filename] = checked
+        validated[filename] = load_and_validate_result_file(
+            root / filename,
+            expected_lane["models"],
+            capability_profile=expected_lane["capability_profile"],
+            capability_models=expected_lane["capability_models"],
+        )
+        restart_filename = filename.replace(
+            "llamacpp_validation_", "llamacpp_restart_validation_", 1
+        )
+        validated[restart_filename] = load_and_validate_result_file(
+            root / restart_filename,
+            [expected_lane["restart_model"]],
+        )
     return validated
 
 
@@ -291,6 +484,8 @@ def main() -> None:
         expected_matrix = json.loads(
             args.expected_matrix_json,
             object_pairs_hook=_unique_json_object,
+            parse_constant=_reject_json_constant,
+            parse_float=_parse_finite_float,
         )
         results = load_and_validate_results(args.directory, expected_matrix)
     except (json.JSONDecodeError, ValidationEvidenceError) as exc:

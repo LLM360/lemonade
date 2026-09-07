@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from test.utils import llamacpp_release_assets as release_assets
 from test.utils import llamacpp_release_manifest as manifest
 
 
@@ -124,6 +125,41 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
         )
         return release, evidence, source_commit
 
+    def _rocm_source_manifest_fixture(
+        self,
+    ) -> tuple[dict, bytes, str, list[dict]]:
+        release, evidence, source_commit = self._immutable_source_manifest_fixture()
+        document = json.loads(evidence)
+        document["release_repository"] = "lemonade-sdk/llamacpp-rocm"
+        document["schema_version"] = 2
+        targets_by_name = {
+            "a-first.zip": ["gfx1036", "gfx1033", "gfx1035"],
+            "z-last.zip": ["gfx942"],
+        }
+        for binding in document["assets"]:
+            binding["build_targets"] = targets_by_name[binding["name"]]
+        evidence = json.dumps(
+            document,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self._bind_source_evidence(release, evidence)
+        expected = [
+            {
+                "build_targets": ["gfx1033", "gfx1035", "gfx1036"],
+                "digest": document["assets"][0]["digest"],
+                "name": "a-first.zip",
+                "size": 100,
+            },
+            {
+                "build_targets": ["gfx942"],
+                "digest": document["assets"][1]["digest"],
+                "name": "z-last.zip",
+                "size": 200,
+            },
+        ]
+        return release, evidence, source_commit, expected
+
     @staticmethod
     def _bind_source_evidence(release: dict, evidence: bytes) -> None:
         source_asset = next(
@@ -133,6 +169,86 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
         )
         source_asset["size"] = len(evidence)
         source_asset["digest"] = "sha256:" + hashlib.sha256(evidence).hexdigest()
+
+    @staticmethod
+    def _complete_managed_manifest(
+        versions: dict,
+        *,
+        ggml_tag: str = "b1",
+        rocm_tag: str = "b3",
+        lemonade_tag: str = "b2",
+        extra_rocm_target: str | None = None,
+    ) -> str:
+        requirements = release_assets.build_asset_requirements(
+            ggml_release=ggml_tag,
+            rocm_release=rocm_tag,
+            lemonade_release=lemonade_tag,
+            backend_versions=versions,
+        )
+        rocm_targets = release_assets.build_rocm_asset_target_requirements(
+            rocm_release=rocm_tag,
+            backend_versions=versions,
+        )
+        releases = []
+        for release_index, (repository, tag, group) in enumerate(
+            (
+                ("ggml-org/llama.cpp", ggml_tag, "ggml"),
+                ("lemonade-sdk/llamacpp-rocm", rocm_tag, "rocm"),
+                ("lemonade-sdk/llama.cpp", lemonade_tag, "lemonade"),
+            ),
+            start=1,
+        ):
+            payload = release_payload(
+                tag,
+                release_index,
+                release_index * 100,
+                repository="ggml-org/llama.cpp",
+                publisher_claim_type=(
+                    "source-release-tag"
+                    if repository == "ggml-org/llama.cpp"
+                    else "immutable-source-manifest"
+                ),
+            )
+            source_assets = [
+                asset
+                for asset in payload["assets"]
+                if asset["name"] == manifest.SOURCE_MANIFEST_ASSET_NAME
+            ]
+            names = [
+                name
+                for backend_names in requirements[group].values()
+                for name in backend_names
+            ]
+            binary_assets = [
+                {
+                    "digest": "sha256:" + f"{release_index * 1000 + index:064x}",
+                    "id": release_index * 1000 + index,
+                    "name": name,
+                    "size": index,
+                    "state": "uploaded",
+                    "updated_at": "2026-09-05T12:40:00Z",
+                }
+                for index, name in enumerate(names, start=1)
+            ]
+            payload["assets"] = binary_assets + source_assets
+            if repository == "lemonade-sdk/llamacpp-rocm":
+                assets_by_name = {asset["name"]: asset for asset in binary_assets}
+                payload["build_target_attestations"] = []
+                for name, required_targets in rocm_targets.items():
+                    target_asset = assets_by_name[name]
+                    build_targets = list(required_targets)
+                    if extra_rocm_target is not None:
+                        build_targets.append(extra_rocm_target)
+                    payload["build_target_attestations"].append(
+                        {
+                            "build_targets": build_targets,
+                            "digest": target_asset["digest"],
+                            "name": name,
+                            "size": target_asset["size"],
+                        }
+                    )
+            releases.append((repository, tag, payload))
+        return manifest.build_release_asset_manifest(releases)
 
     def test_immutable_source_manifest_binds_release_source_and_assets(self) -> None:
         release, evidence, source_commit = self._immutable_source_manifest_fixture()
@@ -152,6 +268,119 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
             ),
             source_commit,
         )
+
+    def test_rocm_source_manifest_normalizes_asset_bound_build_targets(self) -> None:
+        release, evidence, source_commit, expected = (
+            self._rocm_source_manifest_fixture()
+        )
+
+        actual_commit, actual_attestations = (
+            manifest.validate_immutable_source_manifest_with_attestation(
+                evidence,
+                release,
+                "lemonade-sdk/llamacpp-rocm",
+                "b4321",
+                "b" * 40,
+            )
+        )
+
+        self.assertEqual(actual_commit, source_commit)
+        self.assertEqual(actual_attestations, expected)
+
+    def test_legacy_rocm_source_manifest_has_no_build_target_attestation(
+        self,
+    ) -> None:
+        release, evidence, source_commit, _expected = (
+            self._rocm_source_manifest_fixture()
+        )
+        document = json.loads(evidence)
+        document["schema_version"] = 1
+        for binding in document["assets"]:
+            binding.pop("build_targets")
+        legacy = json.dumps(
+            document,
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+        self._bind_source_evidence(release, legacy)
+
+        actual_commit, actual_attestations = (
+            manifest.validate_immutable_source_manifest_with_attestation(
+                legacy,
+                release,
+                "lemonade-sdk/llamacpp-rocm",
+                "b4321",
+                "b" * 40,
+            )
+        )
+
+        self.assertEqual(actual_commit, source_commit)
+        self.assertEqual(actual_attestations, [])
+
+    def test_rocm_build_target_attestation_rejects_malformed_or_duplicate_claims(
+        self,
+    ) -> None:
+        release, evidence, _source_commit, _expected = (
+            self._rocm_source_manifest_fixture()
+        )
+        document = json.loads(evidence)
+        cases = (
+            (
+                "concrete ROCm ISA",
+                lambda value: value["assets"][0]["build_targets"].append("gfx103X"),
+            ),
+            (
+                "duplicate build target",
+                lambda value: value["assets"][0]["build_targets"].append("gfx1033"),
+            ),
+            (
+                "build_targets must be an array",
+                lambda value: value["assets"][0].update(build_targets="gfx1033"),
+            ),
+            (
+                "unexpected fields",
+                lambda value: value["assets"][0].update(unexpected=True),
+            ),
+        )
+        for expected_error, mutate in cases:
+            with self.subTest(expected_error=expected_error):
+                changed = copy.deepcopy(document)
+                mutate(changed)
+                changed_bytes = json.dumps(
+                    changed,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ).encode("utf-8")
+                changed_release = copy.deepcopy(release)
+                self._bind_source_evidence(changed_release, changed_bytes)
+                with self.assertRaisesRegex(
+                    manifest.ReleaseManifestError,
+                    expected_error,
+                ):
+                    manifest.validate_immutable_source_manifest_with_attestation(
+                        changed_bytes,
+                        changed_release,
+                        "lemonade-sdk/llamacpp-rocm",
+                        "b4321",
+                        "b" * 40,
+                    )
+
+    def test_source_manifest_schema_two_is_reserved_for_rocm(self) -> None:
+        release, evidence, _source_commit, _expected = (
+            self._rocm_source_manifest_fixture()
+        )
+
+        with self.assertRaisesRegex(
+            manifest.ReleaseManifestError,
+            "schema_version 2 is only valid",
+        ):
+            manifest.validate_immutable_source_manifest_with_attestation(
+                evidence,
+                release,
+                "lemonade-sdk/llama.cpp",
+                "b4321",
+                "b" * 40,
+            )
 
     def test_immutable_source_manifest_rejects_unbound_or_ambiguous_input(self) -> None:
         release, evidence, _source_commit = self._immutable_source_manifest_fixture()
@@ -411,7 +640,7 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
 
         self.assertEqual(first, second)
         parsed = json.loads(first)
-        self.assertEqual(parsed["schema_version"], 4)
+        self.assertEqual(parsed["schema_version"], 5)
         self.assertEqual(
             [release["repository"] for release in parsed["releases"]],
             ["ggml-org/llama.cpp", "lemonade-sdk/llamacpp-rocm"],
@@ -424,6 +653,70 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
             parsed["releases"][0]["assets"][1]["digest"],
             "sha256:" + "b" * 64,
         )
+
+    def test_release_manifest_carries_normalized_rocm_build_targets(self) -> None:
+        payload = copy.deepcopy(self.rocm)
+        target_asset = payload["assets"][0]
+        payload["build_target_attestations"] = [
+            {
+                "build_targets": ["gfx1036", "gfx1033", "gfx1035"],
+                "digest": target_asset["digest"].lower(),
+                "name": target_asset["name"],
+                "size": target_asset["size"],
+            }
+        ]
+
+        canonical = manifest.build_release_asset_manifest(
+            [("lemonade-sdk/llamacpp-rocm", "b1235", payload)]
+        )
+        release = json.loads(canonical)["releases"][0]
+
+        self.assertEqual(
+            release["build_target_attestations"],
+            [
+                {
+                    "build_targets": ["gfx1033", "gfx1035", "gfx1036"],
+                    "digest": target_asset["digest"].lower(),
+                    "name": target_asset["name"],
+                    "size": target_asset["size"],
+                }
+            ],
+        )
+        self.assertEqual(
+            manifest.canonicalize_release_asset_manifest(canonical), canonical
+        )
+
+    def test_release_manifest_rejects_tampered_rocm_build_target_binding(self) -> None:
+        payload = copy.deepcopy(self.rocm)
+        target_asset = payload["assets"][0]
+        base_attestation = {
+            "build_targets": ["gfx1033"],
+            "digest": target_asset["digest"].lower(),
+            "name": target_asset["name"],
+            "size": target_asset["size"],
+        }
+        cases = (
+            ("does not match release asset", {**base_attestation, "size": 999}),
+            (
+                "duplicate build target",
+                {**base_attestation, "build_targets": ["gfx1033", "gfx1033"]},
+            ),
+            (
+                "concrete ROCm ISA",
+                {**base_attestation, "build_targets": ["gfx103X"]},
+            ),
+        )
+        for expected_error, attestation in cases:
+            with self.subTest(expected_error=expected_error):
+                changed = copy.deepcopy(payload)
+                changed["build_target_attestations"] = [attestation]
+                with self.assertRaisesRegex(
+                    manifest.ReleaseManifestError,
+                    expected_error,
+                ):
+                    manifest.build_release_asset_manifest(
+                        [("lemonade-sdk/llamacpp-rocm", "b1235", changed)]
+                    )
 
     def test_every_asset_requires_a_sha256_digest(self) -> None:
         for digest in (None, "", "md5:" + "a" * 32, "sha256:abc"):
@@ -668,6 +961,147 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
             )
         )
 
+    def test_rocm_selector_changes_require_their_managed_manifest_groups(self) -> None:
+        base = {
+            "llamacpp": {
+                "cpu": "b1",
+                "cuda": "b2",
+                "metal": "b1",
+                "rocm-nightly": "b3",
+                "rocm-stable": "b2",
+                "vulkan": "b1",
+            },
+            "rocm_asset_families": {"gfx1033": "gfx103X"},
+            "therock": {"version": "7.14.0"},
+        }
+
+        mapping_change = copy.deepcopy(base)
+        mapping_change["rocm_asset_families"]["gfx1033"] = "gfx1033"
+        self.assertEqual(
+            manifest.managed_llamacpp_pin_changes(base, mapping_change),
+            {"rocm-nightly": ("b3", "b3")},
+        )
+
+        therock_change = copy.deepcopy(base)
+        therock_change["therock"]["version"] = "7.15.0"
+        self.assertEqual(
+            manifest.managed_llamacpp_pin_changes(base, therock_change),
+            {"rocm-stable": ("b2", "b2")},
+        )
+
+        for field, value in (
+            ("architectures", ["gfx103X", "gfx110X"]),
+            ("url_mapping", {"windows": "runtime.zip"}),
+        ):
+            with self.subTest(field=field):
+                changed = copy.deepcopy(base)
+                changed["therock"][field] = value
+                self.assertEqual(
+                    manifest.managed_llamacpp_pin_changes(base, changed),
+                    {"rocm-stable": ("b2", "b2")},
+                )
+
+        comment_only = copy.deepcopy(base)
+        comment_only["therock"]["comment"] = "documentation only"
+        self.assertEqual(
+            manifest.managed_llamacpp_pin_changes(base, comment_only),
+            {},
+        )
+
+    def test_rocm_pin_manifest_requires_complete_candidate_target_attestation(
+        self,
+    ) -> None:
+        base = {
+            "llamacpp": {
+                "cpu": "b1",
+                "cuda": "b2",
+                "metal": "b1",
+                "rocm-nightly": "b3",
+                "rocm-stable": "b2",
+                "vulkan": "b1",
+            },
+            "rocm_asset_families": {
+                "gfx1033": "gfx103X",
+                "gfx1035": "gfx103X",
+                "gfx1036": "gfx103X",
+            },
+            "therock": {"version": "7.14.0"},
+        }
+        candidate = copy.deepcopy(base)
+        candidate["llamacpp"]["rocm-nightly"] = "b9"
+        complete = self._complete_managed_manifest(
+            candidate,
+            rocm_tag="b9",
+            extra_rocm_target="gfx999",
+        )
+        self.assertTrue(
+            manifest.require_release_manifest_for_managed_pin_changes(
+                base,
+                candidate,
+                complete,
+            )
+        )
+
+        incomplete = json.loads(complete)
+        rocm_release = next(
+            release
+            for release in incomplete["releases"]
+            if release["repository"] == "lemonade-sdk/llamacpp-rocm"
+        )
+        target_attestation = next(
+            attestation
+            for attestation in rocm_release["build_target_attestations"]
+            if attestation["name"] == "llama-b9-windows-rocm-gfx103X-x64.zip"
+        )
+        target_attestation["build_targets"].remove("gfx1035")
+        with self.assertRaisesRegex(
+            manifest.ReleaseManifestError,
+            "incomplete build-target attestation",
+        ):
+            manifest.require_release_manifest_for_managed_pin_changes(
+                base,
+                candidate,
+                json.dumps(incomplete),
+            )
+
+        rocm_release["build_target_attestations"] = []
+        with self.assertRaisesRegex(
+            manifest.ReleaseManifestError,
+            "incomplete build-target attestation",
+        ):
+            manifest.require_release_manifest_for_managed_pin_changes(
+                base,
+                candidate,
+                json.dumps(incomplete),
+            )
+
+    def test_rocm_mapping_only_change_rejects_manifest_for_old_mapping(self) -> None:
+        base = {
+            "llamacpp": {
+                "cpu": "b1",
+                "cuda": "b2",
+                "metal": "b1",
+                "rocm-nightly": "b3",
+                "rocm-stable": "b2",
+                "vulkan": "b1",
+            },
+            "rocm_asset_families": {"gfx1033": "gfx103X"},
+            "therock": {"version": "7.14.0"},
+        }
+        candidate = copy.deepcopy(base)
+        candidate["rocm_asset_families"]["gfx1033"] = "gfx1033"
+        old_mapping_manifest = self._complete_managed_manifest(base)
+
+        with self.assertRaisesRegex(
+            manifest.ReleaseManifestError,
+            "llamacpp.rocm-nightly",
+        ):
+            manifest.require_release_manifest_for_managed_pin_changes(
+                base,
+                candidate,
+                old_mapping_manifest,
+            )
+
     def test_changed_managed_pin_requires_a_matching_release_manifest(self) -> None:
         base = {
             "llamacpp": {
@@ -677,13 +1111,36 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
                 "rocm-nightly": "b3",
                 "rocm-stable": "b2",
                 "vulkan": "b1",
-            }
+            },
+            "rocm_asset_families": {},
+            "therock": {"version": "7.14.0"},
         }
         candidate = copy.deepcopy(base)
         candidate["llamacpp"]["vulkan"] = "b1234"
+        requirements = release_assets.build_asset_requirements(
+            ggml_release="b1234",
+            rocm_release="b3",
+            lemonade_release="b2",
+            backend_versions=candidate,
+        )
+        ggml = copy.deepcopy(self.ggml)
+        for offset, asset_name in enumerate(
+            requirements["ggml"]["vulkan"],
+            start=1,
+        ):
+            ggml["assets"].append(
+                {
+                    "digest": "sha256:" + f"{offset:064x}",
+                    "id": 1000 + offset,
+                    "name": asset_name,
+                    "size": offset,
+                    "state": "uploaded",
+                    "updated_at": "2026-09-05T12:40:00Z",
+                }
+            )
         release_manifest = manifest.build_release_asset_manifest(
             [
-                ("ggml-org/llama.cpp", "b1234", self.ggml),
+                ("ggml-org/llama.cpp", "b1234", ggml),
                 (
                     "lemonade-sdk/llamacpp-rocm",
                     "b3",
@@ -724,6 +1181,41 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
                 release_manifest,
             )
         )
+
+        required_asset = requirements["ggml"]["vulkan"][-1]
+        for defect in ("missing", "zero-size"):
+            with self.subTest(defect=defect):
+                incomplete = json.loads(release_manifest)
+                ggml_release = next(
+                    release
+                    for release in incomplete["releases"]
+                    if release["repository"] == "ggml-org/llama.cpp"
+                )
+                if defect == "missing":
+                    ggml_release["assets"] = [
+                        asset
+                        for asset in ggml_release["assets"]
+                        if asset["name"] != required_asset
+                    ]
+                    expected_error = "missing required asset"
+                else:
+                    target_asset = next(
+                        asset
+                        for asset in ggml_release["assets"]
+                        if asset["name"] == required_asset
+                    )
+                    target_asset["size"] = 0
+                    expected_error = "positive size"
+
+                with self.assertRaisesRegex(
+                    manifest.ReleaseManifestError,
+                    expected_error,
+                ):
+                    manifest.require_release_manifest_for_managed_pin_changes(
+                        base,
+                        candidate,
+                        json.dumps(incomplete),
+                    )
 
         mismatched = json.loads(release_manifest)
         mismatched["releases"][0]["tag_name"] = "b9999"
@@ -803,7 +1295,7 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
         canonical = manifest.build_release_asset_manifest(
             [("ggml-org/llama.cpp", "b1234", self.ggml)]
         )
-        duplicate = canonical[:-1] + ',"schema_version":4}'
+        duplicate = canonical[:-1] + ',"schema_version":5}'
 
         with self.assertRaisesRegex(
             manifest.ReleaseManifestError,
@@ -817,14 +1309,14 @@ class LlamaCppReleaseManifestTests(unittest.TestCase):
                 [("ggml-org/llama.cpp", "b1234", self.ggml)]
             )
         )
-        for schema_version in (True, 4.0, "4"):
+        for schema_version in (True, 5.0, "5"):
             with self.subTest(schema_version=schema_version):
                 changed = copy.deepcopy(canonical)
                 changed["schema_version"] = schema_version
 
                 with self.assertRaisesRegex(
                     manifest.ReleaseManifestError,
-                    "schema_version must be 4",
+                    "schema_version must be 5",
                 ):
                     manifest.canonicalize_release_asset_manifest(json.dumps(changed))
 

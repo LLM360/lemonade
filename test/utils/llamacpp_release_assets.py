@@ -6,6 +6,7 @@ import re
 from collections.abc import Collection, Iterable, Mapping
 
 _RELEASE_RE = re.compile(r"^b[0-9]+$")
+_ROCM_CONCRETE_ISA_RE = re.compile(r"^gfx[0-9a-f]{3,4}$")
 _CUDA_COMPUTE_CAPABILITIES = (
     "sm_75",
     "sm_80",
@@ -16,28 +17,27 @@ _CUDA_COMPUTE_CAPABILITIES = (
     "sm_120",
     "sm_121",
 )
-_ROCM_NIGHTLY_TARGETS_BY_PLATFORM = {
-    "windows": (
-        "gfx1151",
-        "gfx1150",
-        "gfx120X",
-        "gfx110X",
-        "gfx103X",
-        "gfx90a",
-        "gfx908",
-        "gfx1152",
-    ),
-    "ubuntu": (
-        "gfx1151",
-        "gfx1150",
-        "gfx120X",
-        "gfx110X",
-        "gfx103X",
-        "gfx90a",
-        "gfx908",
-        "gfx1152",
-        "gfx942",
-    ),
+_ROCM_RDNA_NIGHTLY_ISAS = (
+    "gfx1030",
+    "gfx1031",
+    "gfx1032",
+    "gfx1033",
+    "gfx1034",
+    "gfx1035",
+    "gfx1036",
+    "gfx1100",
+    "gfx1101",
+    "gfx1102",
+    "gfx1103",
+    "gfx1150",
+    "gfx1151",
+    "gfx1152",
+    "gfx1200",
+    "gfx1201",
+)
+_ROCM_NIGHTLY_ISAS_BY_PLATFORM = {
+    "windows": _ROCM_RDNA_NIGHTLY_ISAS,
+    "ubuntu": (*_ROCM_RDNA_NIGHTLY_ISAS, "gfx908", "gfx90a", "gfx942"),
 }
 
 
@@ -59,17 +59,50 @@ def _therock_major_minor(backend_versions: Mapping[str, object]) -> str:
     return major_minor
 
 
-def _mapped_rocm_targets(
-    targets: Iterable[str], asset_families: Mapping[str, object]
-) -> list[str]:
-    mapped = []
-    for target in targets:
-        family = asset_families.get(target, target)
+def _validate_rocm_asset_families(asset_families: Mapping[str, object]) -> None:
+    for isa, family in asset_families.items():
+        if isa == "comment":
+            continue
+        if not isinstance(isa, str) or _ROCM_CONCRETE_ISA_RE.fullmatch(isa) is None:
+            raise ValueError(
+                f"ROCm asset family key must be a concrete ROCm ISA: {isa!r}"
+            )
         if not isinstance(family, str) or not family:
-            raise ValueError(f"Invalid ROCm asset family for {target}: {family!r}")
-        if family not in mapped:
-            mapped.append(family)
-    return mapped
+            raise ValueError(f"Invalid ROCm asset family for {isa}: {family!r}")
+
+
+def _rocm_asset_families(
+    backend_versions: Mapping[str, object],
+) -> Mapping[str, object]:
+    asset_families = backend_versions.get("rocm_asset_families", {})
+    if not isinstance(asset_families, Mapping):
+        raise ValueError("backend_versions.json rocm_asset_families must be an object")
+    _validate_rocm_asset_families(asset_families)
+    return asset_families
+
+
+def build_rocm_asset_target_requirements(
+    *,
+    rocm_release: str,
+    backend_versions: Mapping[str, object],
+) -> dict[str, tuple[str, ...]]:
+    """Bind every required ROCm nightly asset to its concrete build targets."""
+    release = _validated_release(rocm_release, "ROCM_RELEASE")
+    asset_families = _rocm_asset_families(backend_versions)
+    grouped_targets: dict[str, list[str]] = {}
+    for platform, concrete_isas in _ROCM_NIGHTLY_ISAS_BY_PLATFORM.items():
+        for concrete_isa in concrete_isas:
+            family = asset_families.get(concrete_isa, concrete_isa)
+            if not isinstance(family, str) or not family:
+                raise ValueError(
+                    f"Invalid ROCm asset family for {concrete_isa}: {family!r}"
+                )
+            asset_name = f"llama-{release}-{platform}-rocm-{family}-x64.zip"
+            grouped_targets.setdefault(asset_name, []).append(concrete_isa)
+    return {
+        asset_name: tuple(concrete_isas)
+        for asset_name, concrete_isas in grouped_targets.items()
+    }
 
 
 def build_asset_requirements(
@@ -85,16 +118,12 @@ def build_asset_requirements(
     lemonade_release = _validated_release(lemonade_release, "LEMONADE_RELEASE")
     therock = _therock_major_minor(backend_versions)
 
-    asset_families = backend_versions.get("rocm_asset_families", {})
-    if not isinstance(asset_families, Mapping):
-        raise ValueError("backend_versions.json rocm_asset_families must be an object")
-
-    rocm_nightly = []
-    for platform, targets in _ROCM_NIGHTLY_TARGETS_BY_PLATFORM.items():
-        for target in _mapped_rocm_targets(targets, asset_families):
-            rocm_nightly.append(
-                f"llama-{rocm_release}-{platform}-rocm-{target}-x64.zip"
-            )
+    rocm_nightly = list(
+        build_rocm_asset_target_requirements(
+            rocm_release=rocm_release,
+            backend_versions=backend_versions,
+        )
+    )
 
     cuda = []
     for compute_capability in _CUDA_COMPUTE_CAPABILITIES:
@@ -134,14 +163,41 @@ def build_asset_requirements(
 
 
 def evaluate_asset_group(
-    available_assets: Collection[str],
+    available_assets: Collection[str] | Mapping[str, object],
     backend_requirements: Mapping[str, Iterable[str]],
+    *,
+    required_asset_targets: Mapping[str, Iterable[str]] | None = None,
+    attested_asset_targets: Mapping[str, Iterable[str]] | None = None,
 ) -> tuple[list[str], dict[str, list[str]]]:
     """Return eligible backends and their missing required assets."""
+
+    def has_required_targets(asset: str) -> bool:
+        if required_asset_targets is None:
+            return True
+        required = required_asset_targets.get(asset)
+        if required is None or isinstance(required, str):
+            return False
+        if attested_asset_targets is None:
+            return False
+        attested = attested_asset_targets.get(asset)
+        if attested is None or isinstance(attested, str):
+            return False
+        return set(required).issubset(attested)
+
+    def is_available(asset: str) -> bool:
+        if not isinstance(available_assets, Mapping):
+            has_asset = asset in available_assets
+        else:
+            size = available_assets.get(asset)
+            has_asset = (
+                isinstance(size, int) and not isinstance(size, bool) and size > 0
+            )
+        return has_asset and has_required_targets(asset)
+
     eligible = []
     missing_by_backend = {}
     for backend, required_assets in backend_requirements.items():
-        missing = [asset for asset in required_assets if asset not in available_assets]
+        missing = [asset for asset in required_assets if not is_available(asset)]
         missing_by_backend[backend] = missing
         if not missing:
             eligible.append(backend)

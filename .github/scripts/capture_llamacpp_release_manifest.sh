@@ -61,7 +61,8 @@ if [[ "$upstream_reference" != "$trusted_upstream_reference" ]]; then
     exit 1
 fi
 live_upstream_head=$(gh api \
-    "repos/${trusted_source_repository}/commits/${source_default_branch}" --jq '.sha')
+    "repos/${trusted_source_repository}/commits/heads/${source_default_branch}" \
+    --jq '.sha')
 if ! [[ "$live_upstream_head" =~ ^[0-9a-fA-F]{40}$ ]]; then
     echo "Could not resolve the trusted upstream reference to a full commit." >&2
     exit 1
@@ -91,8 +92,10 @@ attach_release_claims() {
     local release_tag_commit publisher_claim_type
     local publisher_claimed_source_commit comparison_path
     local source_manifest_asset_id source_manifest_path
+    local build_target_attestation_path
 
-    release_tag_commit=$(gh api "repos/${repository}/commits/${tag}" --jq '.sha')
+    release_tag_commit=$(gh api \
+        "repos/${repository}/commits/tags/${tag}" --jq '.sha')
     if ! [[ "$release_tag_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
         echo "Could not resolve ${repository} ${tag} to a release tag commit." >&2
         exit 1
@@ -100,17 +103,21 @@ attach_release_claims() {
     if [[ "$repository" == "$source_repository" ]]; then
         publisher_claim_type="source-release-tag"
         publisher_claimed_source_commit=$release_tag_commit
+        build_target_attestation_path="${source_manifest_directory}/source-release-targets.json"
+        printf '[]\n' >"$build_target_attestation_path"
     else
         publisher_claim_type="immutable-source-manifest"
         source_manifest_asset_id=$(python "$manifest_tool" \
             --source-manifest-asset-id "$path" "$repository")
         source_manifest_path="${source_manifest_directory}/source-${source_manifest_asset_id}.json"
+        build_target_attestation_path="${source_manifest_path}.build-targets"
         gh api "repos/${repository}/releases/assets/${source_manifest_asset_id}" \
             -H "Accept: application/octet-stream" |
             head -c "$((source_manifest_max_bytes + 1))" >"$source_manifest_path"
         publisher_claimed_source_commit=$(python "$manifest_tool" \
             --validate-source-manifest "$source_manifest_path" "$path" \
-            "$repository" "$tag" "$release_tag_commit")
+            "$repository" "$tag" "$release_tag_commit" \
+            --build-target-attestation-output "$build_target_attestation_path")
     fi
     if ! [[ "$publisher_claimed_source_commit" =~ ^[0-9a-fA-F]{40}$ ]]; then
         echo "${repository} ${tag} did not bind one full upstream source commit." >&2
@@ -124,13 +131,15 @@ attach_release_claims() {
         --require-upstream-ancestry "$comparison_path" "$source_repository" \
         "$publisher_claimed_source_commit" "$upstream_reference_head"
     jq \
+        --slurpfile build_target_attestations "$build_target_attestation_path" \
         --arg publisher_claim_type "$publisher_claim_type" \
         --arg publisher_claimed_source_commit "$publisher_claimed_source_commit" \
         --arg release_tag_commit "$release_tag_commit" \
         --arg source_repository "$source_repository" \
         --arg upstream_reference "$upstream_reference" \
         --arg upstream_reference_head "$upstream_reference_head" \
-        '.publisher_claim_type = $publisher_claim_type
+        '.build_target_attestations = $build_target_attestations[0]
+         | .publisher_claim_type = $publisher_claim_type
          | .publisher_claimed_source_commit = $publisher_claimed_source_commit
          | .release_tag_commit = $release_tag_commit
          | .source_repository = $source_repository

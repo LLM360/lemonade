@@ -11,13 +11,28 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import urlparse
 
+if __package__:
+    from .llamacpp_release_assets import (
+        build_asset_requirements,
+        build_rocm_asset_target_requirements,
+        evaluate_asset_group,
+    )
+else:
+    from llamacpp_release_assets import (  # type: ignore[import-not-found]
+        build_asset_requirements,
+        build_rocm_asset_target_requirements,
+        evaluate_asset_group,
+    )
+
 SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-fA-F]{64}$")
 LOWER_SHA256_DIGEST_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 GIT_OID_RE = re.compile(r"^[0-9a-fA-F]{40}$")
 RELEASE_TAG_RE = re.compile(r"^b[0-9]+$")
+ROCM_CONCRETE_ISA_RE = re.compile(r"^gfx[0-9a-f]{3,4}$")
 SOURCE_MANIFEST_ASSET_NAME = ".llamacpp-source.json"
 SOURCE_MANIFEST_MAX_BYTES = 65_536
 TRUSTED_SOURCE_REPOSITORY = "ggml-org/llama.cpp"
+ROCM_RELEASE_REPOSITORY = "lemonade-sdk/llamacpp-rocm"
 PUBLISHER_CLAIM_TYPES = frozenset({"immutable-source-manifest", "source-release-tag"})
 FORK_RELEASE_REPOSITORIES = frozenset(
     {"lemonade-sdk/llama.cpp", "lemonade-sdk/llamacpp-rocm"}
@@ -29,6 +44,11 @@ MANAGED_PIN_REPOSITORIES = {
     "rocm-nightly": "lemonade-sdk/llamacpp-rocm",
     "rocm-stable": "lemonade-sdk/llama.cpp",
     "vulkan": "ggml-org/llama.cpp",
+}
+ASSET_REQUIREMENT_GROUPS = {
+    "ggml-org/llama.cpp": "ggml",
+    "lemonade-sdk/llama.cpp": "lemonade",
+    "lemonade-sdk/llamacpp-rocm": "rocm",
 }
 
 
@@ -196,14 +216,36 @@ def _source_manifest_asset_bindings(
     return sorted(bindings, key=lambda asset: asset["name"])
 
 
-def validate_immutable_source_manifest(
+def _normalize_build_targets(value: object, prefix: str) -> list[str]:
+    if not isinstance(value, list):
+        raise ReleaseManifestError(f"{prefix} build_targets must be an array")
+    targets = []
+    seen: set[str] = set()
+    for target in value:
+        if (
+            not isinstance(target, str)
+            or ROCM_CONCRETE_ISA_RE.fullmatch(target) is None
+        ):
+            raise ReleaseManifestError(
+                f"{prefix} build target must be a concrete ROCm ISA"
+            )
+        if target in seen:
+            raise ReleaseManifestError(
+                f"{prefix} has duplicate build target {target!r}"
+            )
+        seen.add(target)
+        targets.append(target)
+    return sorted(targets)
+
+
+def validate_immutable_source_manifest_with_attestation(
     evidence: bytes,
     release_payload: object,
     release_repository: str,
     release_tag: str,
     release_tag_commit: str,
-) -> str:
-    """Validate one immutable publisher claim and return its upstream source OID."""
+) -> tuple[str, list[dict]]:
+    """Validate one immutable publisher claim and normalize its build targets."""
     source_asset = locate_immutable_source_manifest_asset(
         release_payload,
         release_repository,
@@ -249,13 +291,19 @@ def validate_immutable_source_manifest(
         raise ReleaseManifestError(
             f"{release_repository}: source manifest has unexpected fields"
         )
-    if (
-        isinstance(document["schema_version"], bool)
-        or not isinstance(document["schema_version"], int)
-        or document["schema_version"] != 1
-    ):
+    schema_version = document["schema_version"]
+    if isinstance(schema_version, bool) or not isinstance(schema_version, int):
         raise ReleaseManifestError(
-            f"{release_repository}: source manifest schema_version must be 1"
+            f"{release_repository}: source manifest schema_version must be 1 or 2"
+        )
+    if schema_version == 2 and release_repository != ROCM_RELEASE_REPOSITORY:
+        raise ReleaseManifestError(
+            f"{release_repository}: source manifest schema_version 2 is only valid "
+            f"for {ROCM_RELEASE_REPOSITORY}"
+        )
+    if schema_version not in {1, 2}:
+        raise ReleaseManifestError(
+            f"{release_repository}: source manifest schema_version must be 1 or 2"
         )
     if document["release_repository"] != release_repository:
         raise ReleaseManifestError(
@@ -296,7 +344,10 @@ def validate_immutable_source_manifest(
     names: set[str] = set()
     for index, binding in enumerate(raw_bindings):
         prefix = f"{release_repository}: source manifest asset {index}"
-        if not isinstance(binding, dict) or set(binding) != {"digest", "name", "size"}:
+        expected_binding_keys = {"digest", "name", "size"}
+        if schema_version == 2:
+            expected_binding_keys.add("build_targets")
+        if not isinstance(binding, dict) or set(binding) != expected_binding_keys:
             raise ReleaseManifestError(f"{prefix} has unexpected fields")
         name = binding["name"]
         if not isinstance(name, str) or not name:
@@ -319,17 +370,115 @@ def validate_immutable_source_manifest(
             or LOWER_SHA256_DIGEST_RE.fullmatch(digest) is None
         ):
             raise ReleaseManifestError(f"{prefix} must have a lowercase sha256 digest")
-        bindings.append({"digest": digest, "name": name, "size": size})
+        normalized_binding = {"digest": digest, "name": name, "size": size}
+        if schema_version == 2:
+            normalized_binding["build_targets"] = _normalize_build_targets(
+                binding["build_targets"],
+                prefix,
+            )
+        bindings.append(normalized_binding)
     expected_bindings = _source_manifest_asset_bindings(
         release_payload,
         release_repository,
     )
-    if sorted(bindings, key=lambda asset: asset["name"]) != expected_bindings:
+    bound_asset_metadata = [
+        {"digest": binding["digest"], "name": binding["name"], "size": binding["size"]}
+        for binding in bindings
+    ]
+    if (
+        sorted(bound_asset_metadata, key=lambda asset: asset["name"])
+        != expected_bindings
+    ):
         raise ReleaseManifestError(
             f"{release_repository}: source manifest asset metadata does not match "
             "the immutable release"
         )
-    return source_commit.lower()
+    attestations = (
+        sorted(bindings, key=lambda asset: asset["name"]) if schema_version == 2 else []
+    )
+    return source_commit.lower(), attestations
+
+
+def validate_immutable_source_manifest(
+    evidence: bytes,
+    release_payload: object,
+    release_repository: str,
+    release_tag: str,
+    release_tag_commit: str,
+) -> str:
+    """Validate one immutable publisher claim and return its upstream source OID."""
+    source_commit, _ = validate_immutable_source_manifest_with_attestation(
+        evidence,
+        release_payload,
+        release_repository,
+        release_tag,
+        release_tag_commit,
+    )
+    return source_commit
+
+
+def _canonical_build_target_attestations(
+    repository: str,
+    value: object,
+    release_assets: list[dict],
+) -> list[dict]:
+    if not isinstance(value, list):
+        raise ReleaseManifestError(
+            f"{repository}: build_target_attestations must be an array"
+        )
+    if repository != ROCM_RELEASE_REPOSITORY and value:
+        raise ReleaseManifestError(
+            f"{repository}: build target attestations are only valid for "
+            f"{ROCM_RELEASE_REPOSITORY}"
+        )
+    release_bindings = {
+        (asset["name"], asset["size"], asset["digest"])
+        for asset in release_assets
+        if asset["name"] != SOURCE_MANIFEST_ASSET_NAME
+    }
+    attestations = []
+    names: set[str] = set()
+    for index, attestation in enumerate(value):
+        prefix = f"{repository}: build target attestation {index}"
+        if not isinstance(attestation, dict) or set(attestation) != {
+            "build_targets",
+            "digest",
+            "name",
+            "size",
+        }:
+            raise ReleaseManifestError(f"{prefix} has unexpected fields")
+        name = attestation["name"]
+        if not isinstance(name, str) or not name:
+            raise ReleaseManifestError(f"{prefix} name must be nonempty")
+        if name in names:
+            raise ReleaseManifestError(
+                f"{repository}: duplicate build target attestation for {name!r}"
+            )
+        names.add(name)
+        size = attestation["size"]
+        if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+            raise ReleaseManifestError(f"{prefix} size must be nonnegative")
+        digest = attestation["digest"]
+        if (
+            not isinstance(digest, str)
+            or LOWER_SHA256_DIGEST_RE.fullmatch(digest) is None
+        ):
+            raise ReleaseManifestError(f"{prefix} must have a lowercase sha256 digest")
+        if (name, size, digest) not in release_bindings:
+            raise ReleaseManifestError(
+                f"{prefix} does not match release asset name, size, and digest"
+            )
+        attestations.append(
+            {
+                "build_targets": _normalize_build_targets(
+                    attestation["build_targets"], prefix
+                ),
+                "digest": digest,
+                "name": name,
+                "size": size,
+            }
+        )
+    return sorted(attestations, key=lambda item: item["name"])
 
 
 def _canonical_release(
@@ -461,6 +610,11 @@ def _canonical_release(
         )
 
     assets.sort(key=lambda asset: (asset["name"], asset["id"]))
+    build_target_attestations = _canonical_build_target_attestations(
+        repository,
+        payload.get("build_target_attestations", []),
+        assets,
+    )
     if publisher_claim_type == "immutable-source-manifest":
         source_assets = [
             asset for asset in assets if asset["name"] == SOURCE_MANIFEST_ASSET_NAME
@@ -480,6 +634,7 @@ def _canonical_release(
             )
     return {
         "assets": assets,
+        "build_target_attestations": build_target_attestations,
         "publisher_claim_type": publisher_claim_type,
         "publisher_claimed_source_commit": publisher_claimed_source_commit.lower(),
         "release_draft": release_draft,
@@ -520,7 +675,7 @@ def build_release_asset_manifest(
         )
     canonical_releases.sort(key=lambda release: release["repository"])
     return json.dumps(
-        {"releases": canonical_releases, "schema_version": 4},
+        {"releases": canonical_releases, "schema_version": 5},
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -532,9 +687,9 @@ def canonicalize_release_asset_manifest(manifest_json: str) -> str:
         not isinstance(document, dict)
         or isinstance(document.get("schema_version"), bool)
         or not isinstance(document.get("schema_version"), int)
-        or document.get("schema_version") != 4
+        or document.get("schema_version") != 5
     ):
-        raise ReleaseManifestError("release manifest schema_version must be 4")
+        raise ReleaseManifestError("release manifest schema_version must be 5")
     releases = document.get("releases")
     if not isinstance(releases, list):
         raise ReleaseManifestError("release manifest releases must be an array")
@@ -545,6 +700,7 @@ def canonicalize_release_asset_manifest(manifest_json: str) -> str:
             raise ReleaseManifestError("release manifest entry must be an object")
         expected_keys = {
             "assets",
+            "build_target_attestations",
             "publisher_claim_type",
             "publisher_claimed_source_commit",
             "release_draft",
@@ -565,6 +721,7 @@ def canonicalize_release_asset_manifest(manifest_json: str) -> str:
                 release["tag_name"],
                 {
                     "assets": release["assets"],
+                    "build_target_attestations": release["build_target_attestations"],
                     "draft": release["release_draft"],
                     "id": release["release_id"],
                     "immutable": release["release_immutable"],
@@ -621,11 +778,39 @@ def managed_llamacpp_pin_changes(
         sections.append(section)
 
     base_section, candidate_section = sections
-    return {
+    changes = {
         backend: (base_section[backend], candidate_section[backend])
         for backend in MANAGED_PIN_REPOSITORIES
         if base_section[backend] != candidate_section[backend]
     }
+
+    def therock_selector(document: object) -> object:
+        if not isinstance(document, dict):
+            return None
+        therock = document.get("therock")
+        if not isinstance(therock, dict):
+            return therock
+        return {key: value for key, value in therock.items() if key != "comment"}
+
+    def rocm_asset_families(document: object) -> object:
+        if not isinstance(document, dict):
+            return None
+        families = document.get("rocm_asset_families")
+        if not isinstance(families, dict):
+            return families
+        return {key: value for key, value in families.items() if key != "comment"}
+
+    if therock_selector(base_versions) != therock_selector(candidate_versions):
+        changes.setdefault(
+            "rocm-stable",
+            (base_section["rocm-stable"], candidate_section["rocm-stable"]),
+        )
+    if rocm_asset_families(base_versions) != rocm_asset_families(candidate_versions):
+        changes.setdefault(
+            "rocm-nightly",
+            (base_section["rocm-nightly"], candidate_section["rocm-nightly"]),
+        )
+    return changes
 
 
 def require_release_manifest_for_managed_pin_changes(
@@ -656,6 +841,59 @@ def require_release_manifest_for_managed_pin_changes(
             raise ReleaseManifestError(
                 f"release manifest does not match changed managed llama.cpp pin "
                 f"llamacpp.{backend}={candidate_tag}"
+            )
+
+    try:
+        requirements = build_asset_requirements(
+            ggml_release=releases["ggml-org/llama.cpp"]["tag_name"],
+            rocm_release=releases["lemonade-sdk/llamacpp-rocm"]["tag_name"],
+            lemonade_release=releases["lemonade-sdk/llama.cpp"]["tag_name"],
+            backend_versions=candidate_versions,
+        )
+        rocm_target_requirements = build_rocm_asset_target_requirements(
+            rocm_release=releases[ROCM_RELEASE_REPOSITORY]["tag_name"],
+            backend_versions=candidate_versions,
+        )
+    except ValueError as exc:
+        raise ReleaseManifestError(
+            f"candidate backend versions cannot define release assets: {exc}"
+        ) from exc
+
+    for backend in changes:
+        repository = MANAGED_PIN_REPOSITORIES[backend]
+        group = ASSET_REQUIREMENT_GROUPS[repository]
+        required_assets = requirements[group][backend]
+        asset_sizes = {
+            asset["name"]: asset["size"] for asset in releases[repository]["assets"]
+        }
+        evaluation_options = {}
+        if backend == "rocm-nightly":
+            evaluation_options = {
+                "required_asset_targets": rocm_target_requirements,
+                "attested_asset_targets": {
+                    attestation["name"]: attestation["build_targets"]
+                    for attestation in releases[repository]["build_target_attestations"]
+                },
+            }
+        _, missing_by_backend = evaluate_asset_group(
+            asset_sizes,
+            {backend: required_assets},
+            **evaluation_options,
+        )
+        for asset_name in missing_by_backend[backend]:
+            if backend == "rocm-nightly" and asset_name in asset_sizes:
+                raise ReleaseManifestError(
+                    "release manifest has incomplete build-target attestation for "
+                    f"llamacpp.{backend}: {asset_name}"
+                )
+            if asset_name in asset_sizes:
+                raise ReleaseManifestError(
+                    f"release manifest required asset for llamacpp.{backend} must "
+                    f"have positive size: {asset_name}"
+                )
+            raise ReleaseManifestError(
+                f"release manifest is missing required asset for "
+                f"llamacpp.{backend}: {asset_name}"
             )
     return True
 
@@ -737,6 +975,7 @@ def main() -> None:
             "RELEASE_TAG_COMMIT",
         ),
     )
+    parser.add_argument("--build-target-attestation-output", type=Path)
     parser.add_argument(
         "--require-upstream-ancestry",
         nargs=4,
@@ -765,18 +1004,32 @@ def main() -> None:
         mode is not None
         for mode in (args.source_manifest_asset_id, args.validate_source_manifest)
     )
+    if (
+        args.build_target_attestation_output is not None
+        and args.validate_source_manifest is None
+    ):
+        parser.error(
+            "--build-target-attestation-output requires --validate-source-manifest"
+        )
     if source_modes:
-        if source_modes != 1 or any(
-            (
-                args.release,
-                args.require_upstream_ancestry,
-                args.expected_json is not None,
-                args.github_output,
-                args.manifest_json is not None,
-                args.materialize_manifest,
-                args.append_summary_to,
-                args.managed_pin_changes,
-                args.require_managed_pin_manifest,
+        if (
+            source_modes != 1
+            or (
+                args.source_manifest_asset_id is not None
+                and args.build_target_attestation_output is not None
+            )
+            or any(
+                (
+                    args.release,
+                    args.require_upstream_ancestry,
+                    args.expected_json is not None,
+                    args.github_output,
+                    args.manifest_json is not None,
+                    args.materialize_manifest,
+                    args.append_summary_to,
+                    args.managed_pin_changes,
+                    args.require_managed_pin_manifest,
+                )
             )
         ):
             parser.error("source-manifest modes cannot be combined with other modes")
@@ -796,8 +1049,8 @@ def main() -> None:
                     release_tag,
                     release_tag_commit,
                 ) = args.validate_source_manifest
-                print(
-                    validate_immutable_source_manifest(
+                source_commit, build_target_attestations = (
+                    validate_immutable_source_manifest_with_attestation(
                         Path(source_path).read_bytes(),
                         _load_json_file(Path(release_path)),
                         release_repository,
@@ -805,6 +1058,17 @@ def main() -> None:
                         release_tag_commit,
                     )
                 )
+                if args.build_target_attestation_output is not None:
+                    args.build_target_attestation_output.write_text(
+                        json.dumps(
+                            build_target_attestations,
+                            separators=(",", ":"),
+                            sort_keys=True,
+                        )
+                        + "\n",
+                        encoding="utf-8",
+                    )
+                print(source_commit)
         except (OSError, ReleaseManifestError) as exc:
             parser.exit(1, f"ERROR: {exc}\n")
         return

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable, Iterable
 from typing import Any
 
@@ -37,7 +38,7 @@ CASE_CONTRACTS = {
         None,
     ),
     "openai_reasoning_medium": ("openai", False, "stop", True, True, 0, None),
-    "openai_reasoning_low": ("openai", False, "stop", True, True, 0, None),
+    "openai_reasoning_low": ("openai", False, "stop", True, False, 0, None),
     "openai_tool_json": ("openai", False, "tool_calls", False, False, 1, None),
     "openai_tool_xml": ("openai", False, "tool_calls", False, False, 1, None),
     "openai_tool_xml_typed": (
@@ -95,6 +96,11 @@ EXPECTED_TOOL_ARGUMENTS = {
     "include_hourly": False,
 }
 IFM_CONTROL_PREFIXES = ("<ifm|", "</ifm|", "<|ifm|")
+MAX_STREAM_EVENTS = 4096
+MAX_STREAM_SSE_BYTES = 8 * 1024 * 1024
+MAX_STREAM_TEXT_BYTES = 4 * 1024 * 1024
+MAX_STREAM_TOOL_ARGUMENT_BYTES = 1024 * 1024
+STREAM_WALL_CLOCK_TIMEOUT_SECONDS = 30 * 60
 CASE_FIELDS = {
     "content_chars",
     "error",
@@ -144,11 +150,29 @@ class CapabilityValidationError(ValueError):
     """Raised when a capability response or evidence record is invalid."""
 
 
+def _marker_children(candidate: object):
+    if isinstance(candidate, dict):
+        for key, nested_value in candidate.items():
+            yield f".{key}", nested_value
+    elif isinstance(candidate, (list, tuple)):
+        for index, nested_value in enumerate(candidate):
+            yield f"[{index}]", nested_value
+
+
 def find_raw_ifm_control_marker(value: object, field: str = "response"):
     """Return the first raw IFM marker and its response-field path."""
-    pending = [(field, value)]
+    path_components = [field]
+    pending = [(iter((("", value),)), 1)]
     while pending:
-        path, candidate = pending.pop()
+        children, parent_path_length = pending[-1]
+        try:
+            path_component, candidate = next(children)
+        except StopIteration:
+            pending.pop()
+            continue
+        del path_components[parent_path_length:]
+        if path_component:
+            path_components.append(path_component)
         if isinstance(candidate, str):
             normalized = candidate.lower()
             offsets = [
@@ -161,13 +185,14 @@ def find_raw_ifm_control_marker(value: object, field: str = "response"):
                 end = candidate.find(">", start)
                 if end < 0:
                     end = min(start + 79, len(candidate) - 1)
-                return candidate[start : end + 1], path
-        elif isinstance(candidate, dict):
-            for key, nested_value in reversed(list(candidate.items())):
-                pending.append((f"{path}.{key}", nested_value))
-        elif isinstance(candidate, (list, tuple)):
-            for index in range(len(candidate) - 1, -1, -1):
-                pending.append((f"{path}[{index}]", candidate[index]))
+                return candidate[start : end + 1], "".join(path_components)
+        elif isinstance(candidate, (dict, list, tuple)):
+            pending.append(
+                (
+                    iter(_marker_children(candidate)),
+                    len(path_components),
+                )
+            )
     return None
 
 
@@ -217,6 +242,23 @@ def reject_duplicate_json_object(pairs: list[tuple[str, object]]) -> dict:
             raise CapabilityValidationError(f"JSON object repeats key {key!r}")
         result[key] = value
     return result
+
+
+def _stream_event_size(event: object) -> int:
+    if isinstance(event, bytes):
+        return len(event) + 1
+    if isinstance(event, str):
+        return len(event.encode("utf-8")) + 1
+    try:
+        encoded = json.dumps(
+            event,
+            allow_nan=False,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise CapabilityValidationError("stream event cannot be encoded") from exc
+    return len(encoded) + 1
 
 
 def _validate_tool_arguments(arguments: object) -> dict:
@@ -378,7 +420,11 @@ def _tool_payload(model: str, tool_format: str | None, *, stream: bool) -> dict:
     return payload
 
 
-def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
+def _decode_openai_stream(
+    events: Iterable[object], *, deadline: float | None = None
+) -> tuple[dict, str, bool, str]:
+    if deadline is None:
+        deadline = time.monotonic() + STREAM_WALL_CLOCK_TIMEOUT_SECONDS
     content_parts: list[str] = []
     reasoning_parts: list[str] = []
     tools: dict[int, dict[str, Any]] = {}
@@ -386,8 +432,21 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
     stream_model = None
     saw_choice = False
     saw_done = False
+    total_sse_bytes = 0
+    semantic_event_count = 0
+    total_text_bytes = 0
+    total_tool_argument_bytes = 0
 
     for event_index, event in enumerate(events):
+        _require(
+            time.monotonic() < deadline,
+            "stream exceeded its wall-clock deadline",
+        )
+        total_sse_bytes += _stream_event_size(event)
+        _require(
+            total_sse_bytes <= MAX_STREAM_SSE_BYTES,
+            "stream SSE byte count exceeds bounds",
+        )
         if isinstance(event, bytes):
             try:
                 event = event.decode("utf-8")
@@ -399,6 +458,11 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
             line = event.strip()
             if not line or line.startswith(":"):
                 continue
+            semantic_event_count += 1
+            _require(
+                semantic_event_count <= MAX_STREAM_EVENTS,
+                "stream event count exceeds bounds",
+            )
             _require(
                 not saw_done, "stream contains data after the terminal [DONE] frame"
             )
@@ -423,6 +487,11 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
                     f"stream event {event_index} contains invalid JSON: {exc}"
                 ) from exc
         else:
+            semantic_event_count += 1
+            _require(
+                semantic_event_count <= MAX_STREAM_EVENTS,
+                "stream event count exceeds bounds",
+            )
             _require(
                 not saw_done, "stream contains data after the terminal [DONE] frame"
             )
@@ -464,6 +533,11 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
             value = delta.get(key)
             if value is not None:
                 _require(isinstance(value, str), f"stream {key} must be a string")
+                total_text_bytes += len(value.encode("utf-8"))
+                _require(
+                    total_text_bytes <= MAX_STREAM_TEXT_BYTES,
+                    "stream content and reasoning exceed bounds",
+                )
                 destination.append(value)
 
         tool_deltas = delta.get("tool_calls", [])
@@ -479,7 +553,12 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
             )
             target = tools.setdefault(
                 index,
-                {"id": None, "type": None, "name": "", "arguments": ""},
+                {
+                    "id": None,
+                    "type": None,
+                    "name_parts": [],
+                    "argument_parts": [],
+                },
             )
             for key in ("id", "type"):
                 value = tool_delta.get(key)
@@ -499,14 +578,19 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
                 name = function.get("name")
                 if name is not None:
                     _require(isinstance(name, str), "stream tool name must be a string")
-                    target["name"] += name
+                    target["name_parts"].append(name)
                 arguments = function.get("arguments")
                 if arguments is not None:
                     _require(
                         isinstance(arguments, str),
                         "stream tool arguments must be a string",
                     )
-                    target["arguments"] += arguments
+                    total_tool_argument_bytes += len(arguments.encode("utf-8"))
+                    _require(
+                        total_tool_argument_bytes <= MAX_STREAM_TOOL_ARGUMENT_BYTES,
+                        "stream tool arguments exceed bounds",
+                    )
+                    target["argument_parts"].append(arguments)
 
         current_finish = choice.get("finish_reason")
         if current_finish is not None:
@@ -520,6 +604,7 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
     _require(saw_choice, "stream contains no choice chunks")
     _require(saw_done, "stream is missing the terminal [DONE] frame")
     _require(isinstance(finish_reason, str), "stream has no terminal finish_reason")
+    _require(isinstance(stream_model, str), "stream model is missing")
     tool_calls = []
     for index in sorted(tools):
         tool = tools[index]
@@ -528,8 +613,8 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
                 "id": tool["id"],
                 "type": tool["type"],
                 "function": {
-                    "name": tool["name"],
-                    "arguments": tool["arguments"],
+                    "name": "".join(tool["name_parts"]),
+                    "arguments": "".join(tool["argument_parts"]),
                 },
             }
         )
@@ -540,7 +625,7 @@ def _decode_openai_stream(events: Iterable[object]) -> tuple[dict, str, bool]:
         "tool_calls": tool_calls,
     }
     _marker_free(message, "assembled_message")
-    return message, finish_reason, saw_done
+    return message, finish_reason, saw_done, stream_model
 
 
 def _post_openai_stream(
@@ -549,14 +634,29 @@ def _post_openai_stream(
     timeout: int,
     payload: dict,
 ) -> tuple[dict, str, int, bool]:
-    response, events = request_stream("POST", url, timeout=timeout, json=payload)
+    deadline = time.monotonic() + min(timeout, STREAM_WALL_CLOCK_TIMEOUT_SECONDS)
+    response, events = request_stream(
+        "POST",
+        url,
+        timeout=timeout,
+        wall_clock_deadline=deadline,
+        json=payload,
+    )
     status_code = _status_code(response)
     _require(status_code == 200, f"stream returned HTTP {status_code}")
     expected_model = payload.get("model")
     _require(
         isinstance(expected_model, str) and expected_model, "request model is missing"
     )
-    message, finish_reason, terminal = _decode_openai_stream(events)
+    message, finish_reason, terminal, response_model = _decode_openai_stream(
+        events,
+        deadline=deadline,
+    )
+    _require_response_model(
+        {"model": response_model},
+        expected_model,
+        "stream response",
+    )
     return message, finish_reason, status_code, terminal
 
 
@@ -634,11 +734,22 @@ def _openai_plain_stream_case(request_stream, url, timeout, payload):
     }, message
 
 
-def _openai_reasoning_case(request_json, url, timeout, payload):
+def _openai_reasoning_case(
+    request_json,
+    url,
+    timeout,
+    payload,
+    *,
+    require_reasoning: bool,
+):
     body, status = _post_json(request_json, url, timeout, payload)
     message = _openai_message(body, "stop")
     content = _visible_content(message, "42")
-    reasoning = _reasoning_content(message)
+    if require_reasoning:
+        reasoning = _reasoning_content(message)
+    else:
+        _require_no_reasoning(message)
+        reasoning = ""
     _require_no_tool_calls(message)
     return {
         "status_code": status,
@@ -914,8 +1025,12 @@ def validate_capabilities(
             f"openai_reasoning_{effort}",
             "openai",
             False,
-            lambda payload=payload: _openai_reasoning_case(
-                request_json, openai_url, timeout, payload
+            lambda payload=payload, effort=effort: _openai_reasoning_case(
+                request_json,
+                openai_url,
+                timeout,
+                payload,
+                require_reasoning=effort != "low",
             ),
         )
         if effort == "high":

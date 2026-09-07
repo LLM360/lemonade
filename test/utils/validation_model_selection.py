@@ -35,6 +35,10 @@ def _model_size(model: dict[str, Any]) -> float:
     return math.inf
 
 
+def _canonical_builtin_model_id(model_id: str) -> str:
+    return model_id if model_id.startswith("builtin.") else f"builtin.{model_id}"
+
+
 def _require_pullable_checkpoint(model: dict[str, Any]) -> None:
     checkpoint = model.get("checkpoint")
     if isinstance(checkpoint, str) and checkpoint.strip():
@@ -72,11 +76,7 @@ def select_llamacpp_models(
             )
         selected = []
         for requested_model_id in requested_model_ids:
-            canonical_model_id = (
-                requested_model_id
-                if requested_model_id.startswith("builtin.")
-                else f"builtin.{requested_model_id}"
-            )
+            canonical_model_id = _canonical_builtin_model_id(requested_model_id)
             model = builtin_model_resolver(canonical_model_id)
             if model is None:
                 raise ModelSelectionError(
@@ -84,6 +84,14 @@ def select_llamacpp_models(
                     "model catalog"
                 )
             model = dict(model)
+            resolved_model_id = model.get("id")
+            if not isinstance(resolved_model_id, str) or (
+                _canonical_builtin_model_id(resolved_model_id) != canonical_model_id
+            ):
+                raise ModelSelectionError(
+                    f"requested built-in model '{canonical_model_id}' resolved to "
+                    f"unrelated id '{resolved_model_id}'"
+                )
             model["load_id"] = canonical_model_id
             recipe = model.get("recipe")
             if recipe != "llamacpp":

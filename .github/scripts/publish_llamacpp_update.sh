@@ -13,12 +13,37 @@ llamacpp_release=${LLAMACPP_RELEASE:?LLAMACPP_RELEASE is required}
 lemonade_release=${LLAMACPP_LEMONADE_RELEASE:?LLAMACPP_LEMONADE_RELEASE is required}
 rocm_release=${LLAMACPP_ROCM_RELEASE:?LLAMACPP_ROCM_RELEASE is required}
 expected_release_manifest=${EXPECTED_RELEASE_ASSET_MANIFEST:?EXPECTED_RELEASE_ASSET_MANIFEST is required}
+: "${GH_TOKEN:?GH_TOKEN must contain a separately provisioned publication token}"
+publication_actor=${EXPECTED_PUBLICATION_ACTOR:?EXPECTED_PUBLICATION_ACTOR is required}
+
+if ! authenticated_actor=$(gh api graphql \
+    -f 'query=query { viewer { login } }' \
+    --jq '.data.viewer.login'); then
+    echo "Could not authenticate the dedicated publication token." >&2
+    exit 1
+fi
+if [[ -z "$authenticated_actor" ||
+      "$authenticated_actor" != "$publication_actor" ]]; then
+    echo "The authenticated publication actor does not match EXPECTED_PUBLICATION_ACTOR." >&2
+    exit 1
+fi
 
 script_directory=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 repository_root=$(cd -- "${script_directory}/../.." && pwd)
 manifest_tool="${repository_root}/test/utils/llamacpp_release_manifest.py"
 capture_tool="${script_directory}/capture_llamacpp_release_manifest.sh"
 snapshot_root=$(mktemp -d)
+git_askpass_path="${snapshot_root}/git-askpass.sh"
+# The generated helper expands these variables only when Git invokes it.
+# shellcheck disable=SC2016
+printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'case "$1" in' \
+    '    *Username*) printf "%s\n" x-access-token ;;' \
+    '    *Password*) printf "%s\n" "$GH_TOKEN" ;;' \
+    '    *) exit 1 ;;' \
+    'esac' > "$git_askpass_path"
+chmod 0700 "$git_askpass_path"
 
 manifest_digest=$(python "$manifest_tool" \
     --materialize-manifest "$manifest_path" \
@@ -47,6 +72,12 @@ recheck_release_manifest() {
         "${snapshot_root}/snapshot-${snapshot_number}" >/dev/null
 }
 
+require_managed_pin_manifest() {
+    python "$manifest_tool" \
+        --require-managed-pin-manifest \
+        "$base_versions_path" "$versions_path" "$manifest_path" >/dev/null
+}
+
 release_pattern='^b[0-9]+$'
 for release in "$llamacpp_release" "$lemonade_release" "$rocm_release"; do
     if [[ ! "$release" =~ $release_pattern ]]; then
@@ -61,6 +92,54 @@ if [[ "$local_base_sha" != "$validated_base_sha" ]]; then
     exit 1
 fi
 
+base_versions_path="${snapshot_root}/base-backend-versions.json"
+git show "${validated_base_sha}:${versions_path}" > "$base_versions_path"
+python - "$base_versions_path" "$versions_path" <<'PY'
+import json
+import re
+import sys
+
+managed_backends = ("cpu", "cuda", "metal", "rocm-nightly", "rocm-stable", "vulkan")
+release_pattern = re.compile(r"b[0-9]+")
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as base_file:
+        base_versions = json.load(base_file)["llamacpp"]
+    with open(sys.argv[2], encoding="utf-8") as candidate_file:
+        candidate_versions = json.load(candidate_file)["llamacpp"]
+except (KeyError, OSError, TypeError, ValueError) as error:
+    raise SystemExit(
+        "Scheduled llama.cpp update found invalid llamacpp version mappings."
+    ) from error
+
+if not isinstance(base_versions, dict) or not isinstance(candidate_versions, dict):
+    raise SystemExit(
+        "Scheduled llama.cpp update found invalid llamacpp version mappings."
+    )
+
+for backend in managed_backends:
+    if backend not in base_versions or backend not in candidate_versions:
+        raise SystemExit(
+            f"Scheduled llama.cpp update changed the managed llamacpp.{backend} pin shape."
+        )
+    base_release = base_versions[backend]
+    candidate_release = candidate_versions[backend]
+    if (
+        not isinstance(base_release, str)
+        or release_pattern.fullmatch(base_release) is None
+        or not isinstance(candidate_release, str)
+        or release_pattern.fullmatch(candidate_release) is None
+    ):
+        raise SystemExit(
+            f"Scheduled llama.cpp update found an invalid llamacpp.{backend} release tag."
+        )
+    if int(candidate_release[1:]) < int(base_release[1:]):
+        raise SystemExit(
+            f"Scheduled llama.cpp update would downgrade llamacpp.{backend} "
+            f"from {base_release} to {candidate_release}."
+        )
+PY
+
 if [[ $(git rev-parse --is-shallow-repository) == "true" ]]; then
     git fetch --unshallow --no-tags origin "refs/heads/${base_branch}"
 else
@@ -72,19 +151,24 @@ if [[ "$fetched_base_sha" != "$validated_base_sha" ]]; then
     exit 1
 fi
 
-fresh_llamacpp_release=$(gh api repos/ggml-org/llama.cpp/releases \
-    --jq '[.[] | select(.draft | not) | .tag_name | select(test("^b[0-9]+$"))][0] // empty')
-fresh_rocm_release=$(gh api \
-    repos/lemonade-sdk/llamacpp-rocm/releases/latest --jq '.tag_name')
-fresh_lemonade_release=$(gh api \
-    repos/lemonade-sdk/llama.cpp/releases/latest --jq '.tag_name')
+assert_candidate_releases_current() {
+    local fresh_llamacpp_release fresh_rocm_release fresh_lemonade_release
+    fresh_llamacpp_release=$(gh api repos/ggml-org/llama.cpp/releases \
+        --jq '[.[] | select(.draft | not) | .tag_name | select(test("^b[0-9]+$"))][0] // empty')
+    fresh_rocm_release=$(gh api \
+        repos/lemonade-sdk/llamacpp-rocm/releases/latest --jq '.tag_name')
+    fresh_lemonade_release=$(gh api \
+        repos/lemonade-sdk/llama.cpp/releases/latest --jq '.tag_name')
 
-if [[ "$fresh_llamacpp_release" != "$llamacpp_release" ||
-      "$fresh_rocm_release" != "$rocm_release" ||
-      "$fresh_lemonade_release" != "$lemonade_release" ]]; then
-    echo "The candidate releases changed during validation; refusing publication." >&2
-    exit 1
-fi
+    if [[ "$fresh_llamacpp_release" != "$llamacpp_release" ||
+          "$fresh_rocm_release" != "$rocm_release" ||
+          "$fresh_lemonade_release" != "$lemonade_release" ]]; then
+        echo "The candidate releases changed during validation; refusing publication." >&2
+        exit 1
+    fi
+}
+
+assert_candidate_releases_current
 
 recheck_release_manifest
 
@@ -106,7 +190,6 @@ open_pr_records=$(gh api "repos/${repository}/pulls" \
 
 open_pr=""
 stale_prs=()
-publication_actor='github-actions[bot]'
 while IFS=$'\t' read -r number head_ref head_repository author base_ref; do
     if [[ -z "$number" ]]; then
         continue
@@ -170,6 +253,12 @@ require_pull_request_identity() {
         exit 1
     fi
     pull_request_json=$(gh api "repos/${repository}/pulls/${number}")
+    if ! pull_request_is_draft=$(jq -r \
+        'if (.draft | type) == "boolean" then .draft else error("invalid draft") end' \
+        <<< "$pull_request_json"); then
+        echo "Pull request #${number} has invalid draft state." >&2
+        exit 1
+    fi
     if ! jq -e \
         --arg state "$expected_state" \
         --arg repository "$repository" \
@@ -191,23 +280,64 @@ require_pull_request_identity() {
     fi
 }
 
-close_stale_prs() {
+report_stale_prs() {
     local stale_record stale_pr stale_head_ref
     for stale_record in "${stale_prs[@]}"; do
         IFS=$'\t' read -r stale_pr stale_head_ref <<< "$stale_record"
-        require_pull_request_identity "$stale_pr" "$stale_head_ref"
-        gh api "repos/${repository}/pulls/${stale_pr}" \
-            --method PATCH \
-            -f state=closed >/dev/null
-        require_pull_request_identity "$stale_pr" "$stale_head_ref" "" closed
-        echo "Closed superseded pull request #${stale_pr}."
+        echo "Superseded pull request #${stale_pr} (${stale_head_ref}) requires manual cleanup."
     done
+}
+
+reconcile_failed_pull_request_creation() {
+    local number head_ref head_repository author base_ref head_sha records
+    local matching_pr=""
+    local record_count=0
+
+    failed_create_reconciliation=unknown
+    failed_create_pr=""
+    if ! records=$(gh api "repos/${repository}/pulls" \
+        --method GET \
+        -f state=open \
+        -f head="${repository_owner}:${branch}" \
+        -f base="$base_branch" \
+        --paginate \
+        --jq '.[] | [.number, .head.ref, (.head.repo.full_name // "<deleted>"), .user.login, .base.ref, .head.sha] | @tsv'); then
+        echo "Pull request creation failed, and its result could not be reconciled; preserving ${branch}." >&2
+        return
+    fi
+
+    while IFS=$'\t' read -r number head_ref head_repository author base_ref head_sha; do
+        if [[ -z "$number" ]]; then
+            continue
+        fi
+        record_count=$((record_count + 1))
+        if ! [[ "$number" =~ ^[1-9][0-9]*$ ]] ||
+            [[ "$head_ref" != "$branch" ]] ||
+            [[ "$head_repository" != "$repository" ]] ||
+            [[ "$author" != "$publication_actor" ]] ||
+            [[ "$base_ref" != "$base_branch" ]] ||
+            [[ "$head_sha" != "$published_oid" ]]; then
+            echo "Pull request creation failed, and its result was ambiguous; preserving ${branch}." >&2
+            return
+        fi
+        matching_pr=$number
+    done <<< "$records"
+
+    if [[ "$record_count" -eq 0 ]]; then
+        failed_create_reconciliation=absent
+    elif [[ "$record_count" -eq 1 ]]; then
+        failed_create_reconciliation=adopted
+        failed_create_pr=$matching_pr
+    else
+        echo "Pull request creation failed, and multiple matching pull requests were found; preserving ${branch}." >&2
+    fi
 }
 
 if [[ "$has_update" != "true" ]]; then
     assert_base_is_current
     recheck_release_manifest
-    close_stale_prs
+    assert_candidate_releases_current
+    report_stale_prs
     echo "backend_versions.json is unchanged; nothing to update."
     exit 0
 fi
@@ -244,8 +374,8 @@ elif [[ -n "$open_pr" ]]; then
     exit 1
 fi
 
-git config user.name "github-actions[bot]"
-git config user.email "github-actions[bot]@users.noreply.github.com"
+git config user.name "$publication_actor"
+git config user.email "${publication_actor}@users.noreply.github.com"
 git checkout -b "$branch"
 recheck_release_manifest
 git add "$versions_path" "$manifest_path"
@@ -265,6 +395,7 @@ fi
 
 assert_base_is_current
 recheck_release_manifest
+require_managed_pin_manifest
 if [[ -n "$remote_oid" ]]; then
     lease="refs/heads/${branch}:${remote_oid}"
     push_source="$remote_oid"
@@ -274,7 +405,13 @@ else
     push_source=HEAD
     published_oid=$(git rev-parse HEAD)
 fi
-git push --force-with-lease="$lease" origin \
+assert_candidate_releases_current
+GIT_ASKPASS="$git_askpass_path" \
+    GIT_TERMINAL_PROMPT=0 \
+    GIT_CONFIG_COUNT=1 \
+    GIT_CONFIG_KEY_0=credential.helper \
+    GIT_CONFIG_VALUE_0='' \
+    git push --force-with-lease="$lease" origin \
     "${push_source}:refs/heads/$branch"
 
 assert_base_is_current
@@ -289,20 +426,54 @@ if [[ -n "$open_pr" ]]; then
     current_pr=$open_pr
     echo "Refreshed pull request #${open_pr}."
 else
-    created_pr_url=$(gh pr create \
+    if ! created_pr_url=$(gh pr create \
         --repo "$repository" \
         --title "$title" \
         --body-file "$body_file" \
         --base "$base_branch" \
-        --head "$branch")
-    created_pr_url=${created_pr_url%/}
-    current_pr=${created_pr_url##*/}
+        --head "$branch" \
+        --draft); then
+        assert_candidate_releases_current
+        reconcile_failed_pull_request_creation
+        if [[ "$failed_create_reconciliation" == "adopted" ]]; then
+            current_pr=$failed_create_pr
+            echo "Recovered pull request #${current_pr} after an ambiguous creation result."
+        else
+            if [[ "$failed_create_reconciliation" == "absent" ]]; then
+                echo "Pull request creation failed; preserving ${branch}." >&2
+            fi
+            exit 1
+        fi
+    else
+        created_pr_url=${created_pr_url%/}
+        current_pr=${created_pr_url##*/}
+        created_draft_pr=true
+    fi
 fi
 
 require_pull_request_identity \
     "$current_pr" "$branch" "$published_oid" open "$validated_base_sha"
-close_stale_prs
+if [[ "${created_draft_pr:-false}" == "true" &&
+      "$pull_request_is_draft" != "true" ]]; then
+    echo "New pull request #${current_pr} was not created as a draft." >&2
+    exit 1
+fi
+assert_base_is_current
+assert_publication_branch "$published_oid"
+recheck_release_manifest
+assert_candidate_releases_current
 assert_base_is_current
 assert_publication_branch "$published_oid"
 require_pull_request_identity \
     "$current_pr" "$branch" "$published_oid" open "$validated_base_sha"
+if [[ "$pull_request_is_draft" == "true" ]]; then
+    gh pr ready "$current_pr" --repo "$repository"
+    echo "Marked pull request #${current_pr} ready for review."
+fi
+require_pull_request_identity \
+    "$current_pr" "$branch" "$published_oid" open "$validated_base_sha"
+if [[ "$pull_request_is_draft" != "false" ]]; then
+    echo "Pull request #${current_pr} remained a draft after promotion." >&2
+    exit 1
+fi
+report_stale_prs
