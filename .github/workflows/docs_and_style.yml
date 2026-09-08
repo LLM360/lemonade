@@ -75,30 +75,10 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: '3.x'
-      - run: pip install pre-commit psutil requests openai pyyaml
-      - name: Verify focused worker imports
-        run: python -c "import test.utils.server_base"
-      - name: Run focused Python unit tests
-        run: >-
-          python -m unittest
-          test.test_comment_slop
-          test.test_llamacpp_capabilities
-          test.test_llamacpp_check_reporting
-          test.test_llamacpp_release_manifest
-          test.test_llamacpp_release_assets
-          test.test_llamacpp_validation_artifacts
-          test.test_llamacpp_validation_evidence
-          test.test_llamacpp_pr_file_classification
-          test.test_process_inheritance_contract
-          test.test_publish_llamacpp_update
-          test.test_run_llamacpp_validation
-          test.test_validation_model_catalog
-          test.test_validate_llamacpp_action_pins
-          test.test_validate_llamacpp_selection
-          test.test_validate_llamacpp_trusted_execution
-          test.test_validate_llamacpp_workflow_plan
-          test.test_verify_llamacpp_pin_manifest
-          -v
+      - run: pip install pre-commit
+      - name: Run the comment-slop unit tests
+        run: python -m unittest test.test_comment_slop -v
+
       - name: Run pre-commit on the changed files
         # Scoped to what the change touches; running repo-wide would fail on drift that
         # predates it and is not the contributor's to fix.

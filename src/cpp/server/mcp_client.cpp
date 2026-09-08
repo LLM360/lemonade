@@ -36,9 +36,6 @@
     #include <cstring>
     #include <fcntl.h>
     #include <pthread.h>
-    #ifdef __APPLE__
-        #include <spawn.h>
-    #endif
     #include <sys/stat.h>
     #include <sys/types.h>
     #include <sys/wait.h>
@@ -48,26 +45,6 @@ extern char** environ;
 #endif
 
 namespace fs = std::filesystem;
-
-#if defined(LEMONADE_MCP_PROCESS_TEST_HOOK) && !defined(_WIN32)
-using McpProcessTestHook = void (*)(pid_t);
-
-static std::atomic<McpProcessTestHook> mcp_exit_observed_hook{nullptr};
-static std::atomic<McpProcessTestHook> mcp_group_cleanup_hook{nullptr};
-static std::atomic<McpProcessTestHook> mcp_final_reap_hook{nullptr};
-
-extern "C" void lemonade_test_set_mcp_process_hooks(
-    McpProcessTestHook exit_observed, McpProcessTestHook group_cleanup,
-    McpProcessTestHook final_reap);
-
-extern "C" void lemonade_test_set_mcp_process_hooks(
-    McpProcessTestHook exit_observed, McpProcessTestHook group_cleanup,
-    McpProcessTestHook final_reap) {
-    mcp_exit_observed_hook.store(exit_observed, std::memory_order_release);
-    mcp_group_cleanup_hook.store(group_cleanup, std::memory_order_release);
-    mcp_final_reap_hook.store(final_reap, std::memory_order_release);
-}
-#endif
 
 namespace lemon {
 namespace {
@@ -633,76 +610,42 @@ private:
 #else
         if (pid_ > 0) {
             int status = 0;
-            bool child_identity_retained = true;
-            auto wait_for_exit_without_reaping = [&](auto deadline) {
+            bool reaped = false;
+            auto deadline = std::chrono::steady_clock::now() +
+                            std::chrono::seconds(1);
+            while (std::chrono::steady_clock::now() < deadline) {
+                const pid_t result = ::waitpid(pid_, &status, WNOHANG);
+                if (result == pid_ || (result < 0 && errno == ECHILD)) {
+                    reaped = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            }
+            if (!reaped) {
+                ::kill(-pid_, SIGTERM);
+                deadline = std::chrono::steady_clock::now() +
+                           std::chrono::seconds(1);
                 while (std::chrono::steady_clock::now() < deadline) {
-                    siginfo_t child_info{};
-                    int result;
-                    do {
-                        result = ::waitid(
-                            P_PID, static_cast<id_t>(pid_), &child_info,
-                            WEXITED | WNOHANG | WNOWAIT);
-                    } while (result < 0 && errno == EINTR);
-                    if (result < 0) {
-                        child_identity_retained = false;
-                        return false;
+                    const pid_t result = ::waitpid(pid_, &status, WNOHANG);
+                    if (result == pid_ ||
+                        (result < 0 && errno == ECHILD)) {
+                        reaped = true;
+                        break;
                     }
-                    if (child_info.si_pid == pid_) return true;
                     std::this_thread::sleep_for(
                         std::chrono::milliseconds(25));
                 }
-                return false;
-            };
-
-            const bool exit_observed = wait_for_exit_without_reaping(
-                std::chrono::steady_clock::now() +
-                std::chrono::seconds(1));
-#ifdef LEMONADE_MCP_PROCESS_TEST_HOOK
-            if (exit_observed) {
-                if (const auto hook = mcp_exit_observed_hook.load(
-                        std::memory_order_acquire)) {
-                    hook(pid_);
-                }
             }
-#endif
-            if (child_identity_retained) {
-                ::kill(-pid_, SIGTERM);
-                if (exit_observed) {
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds(50));
-                } else {
-                    const bool observed_after_terminate =
-                        wait_for_exit_without_reaping(
-                        std::chrono::steady_clock::now() +
-                        std::chrono::seconds(1));
-#ifdef LEMONADE_MCP_PROCESS_TEST_HOOK
-                    if (observed_after_terminate) {
-                        if (const auto hook = mcp_exit_observed_hook.load(
-                                std::memory_order_acquire)) {
-                            hook(pid_);
-                        }
-                    }
-#else
-                    (void)observed_after_terminate;
-#endif
-                }
-            }
-            if (child_identity_retained) {
+            if (!reaped) {
                 ::kill(-pid_, SIGKILL);
-#ifdef LEMONADE_MCP_PROCESS_TEST_HOOK
-                if (const auto hook = mcp_group_cleanup_hook.load(
-                        std::memory_order_acquire)) {
-                    hook(pid_);
-                }
-#endif
                 while (::waitpid(pid_, &status, 0) < 0 && errno == EINTR) {
                 }
-#ifdef LEMONADE_MCP_PROCESS_TEST_HOOK
-                if (const auto hook = mcp_final_reap_hook.load(
-                        std::memory_order_acquire)) {
-                    hook(pid_);
-                }
-#endif
+            } else {
+                // Clean up descendants in the process group even when the direct
+                // child exited after stdin was closed.
+                ::kill(-pid_, SIGTERM);
+                std::this_thread::sleep_for(std::chrono::milliseconds(50));
+                ::kill(-pid_, SIGKILL);
             }
         }
 #endif
@@ -1001,40 +944,19 @@ private:
 
     static int create_cloexec_pipe(int fds[2]) {
 #ifdef __linux__
-        if (::pipe2(fds, O_CLOEXEC) != 0) return -1;
+        return ::pipe2(fds, O_CLOEXEC);
 #else
         if (::pipe(fds) != 0) return -1;
-        if (!set_close_on_exec(fds[0]) || !set_close_on_exec(fds[1])) {
-            const int saved_errno = errno;
-            ::close(fds[0]);
-            ::close(fds[1]);
-            fds[0] = fds[1] = -1;
-            errno = saved_errno;
-            return -1;
+        if (set_close_on_exec(fds[0]) && set_close_on_exec(fds[1])) {
+            return 0;
         }
+        const int saved_errno = errno;
+        ::close(fds[0]);
+        ::close(fds[1]);
+        fds[0] = fds[1] = -1;
+        errno = saved_errno;
+        return -1;
 #endif
-
-        for (int index = 0; index < 2; ++index) {
-            int& fd = fds[index];
-            if (fd > STDERR_FILENO) continue;
-
-            int replacement;
-            do {
-                replacement =
-                    ::fcntl(fd, F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
-            } while (replacement < 0 && errno == EINTR);
-            if (replacement < 0) {
-                const int saved_errno = errno;
-                ::close(fds[0]);
-                ::close(fds[1]);
-                fds[0] = fds[1] = -1;
-                errno = saved_errno;
-                return -1;
-            }
-            ::close(fd);
-            fd = replacement;
-        }
-        return 0;
     }
 
     void start_posix(const McpServerConfig& config) {
@@ -1065,108 +987,27 @@ private:
         int stdin_pipe[2] = {-1, -1};
         int stdout_pipe[2] = {-1, -1};
         int stderr_pipe[2] = {-1, -1};
-#ifndef __APPLE__
         int exec_error_pipe[2] = {-1, -1};
-#endif
         auto close_pair = [](int pair[2]) {
             if (pair[0] >= 0) ::close(pair[0]);
             if (pair[1] >= 0) ::close(pair[1]);
             pair[0] = pair[1] = -1;
         };
 
-        bool pipe_creation_failed = create_cloexec_pipe(stdin_pipe) != 0 ||
-                                    create_cloexec_pipe(stdout_pipe) != 0 ||
-                                    create_cloexec_pipe(stderr_pipe) != 0;
-#ifndef __APPLE__
-        pipe_creation_failed = pipe_creation_failed ||
-                               create_cloexec_pipe(exec_error_pipe) != 0;
-#endif
-        if (pipe_creation_failed) {
+        if (create_cloexec_pipe(stdin_pipe) != 0 ||
+            create_cloexec_pipe(stdout_pipe) != 0 ||
+            create_cloexec_pipe(stderr_pipe) != 0 ||
+            create_cloexec_pipe(exec_error_pipe) != 0) {
             const int error = errno;
             close_pair(stdin_pipe);
             close_pair(stdout_pipe);
             close_pair(stderr_pipe);
-#ifndef __APPLE__
             close_pair(exec_error_pipe);
-#endif
             throw std::runtime_error(
                 std::string("pipe creation failed: ") +
                 std::strerror(error));
         }
 
-#ifdef __APPLE__
-        posix_spawn_file_actions_t file_actions;
-        bool file_actions_initialized = false;
-        int launch_error = posix_spawn_file_actions_init(&file_actions);
-        if (launch_error == 0) {
-            file_actions_initialized = true;
-            launch_error = posix_spawn_file_actions_adddup2(
-                &file_actions, stdin_pipe[0], STDIN_FILENO);
-        }
-        if (launch_error == 0) {
-            launch_error = posix_spawn_file_actions_adddup2(
-                &file_actions, stdout_pipe[1], STDOUT_FILENO);
-        }
-        if (launch_error == 0) {
-            launch_error = posix_spawn_file_actions_adddup2(
-                &file_actions, stderr_pipe[1], STDERR_FILENO);
-        }
-        for (int fd : {stdin_pipe[0], stdin_pipe[1], stdout_pipe[0],
-                       stdout_pipe[1], stderr_pipe[0], stderr_pipe[1]}) {
-            if (launch_error == 0) {
-                launch_error =
-                    posix_spawn_file_actions_addclose(&file_actions, fd);
-            }
-        }
-        if (launch_error == 0 && !config.working_dir.empty()) {
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-            launch_error = posix_spawn_file_actions_addchdir_np(
-                &file_actions, config.working_dir.c_str());
-#pragma clang diagnostic pop
-        }
-
-        posix_spawnattr_t attributes;
-        bool attributes_initialized = false;
-        if (launch_error == 0) {
-            launch_error = posix_spawnattr_init(&attributes);
-            attributes_initialized = launch_error == 0;
-        }
-        if (launch_error == 0) {
-            launch_error = posix_spawnattr_setpgroup(&attributes, 0);
-        }
-        if (launch_error == 0) {
-            launch_error = posix_spawnattr_setflags(
-                &attributes, POSIX_SPAWN_CLOEXEC_DEFAULT |
-                                 POSIX_SPAWN_SETPGROUP);
-        }
-
-        pid_t child = 0;
-        if (launch_error == 0) {
-            launch_error = posix_spawn(
-                &child, executable.c_str(), &file_actions, &attributes,
-                argv.data(), envp.data());
-        }
-        if (attributes_initialized) {
-            posix_spawnattr_destroy(&attributes);
-        }
-        if (file_actions_initialized) {
-            posix_spawn_file_actions_destroy(&file_actions);
-        }
-
-        if (launch_error != 0) {
-            close_pair(stdin_pipe);
-            close_pair(stdout_pipe);
-            close_pair(stderr_pipe);
-            throw std::runtime_error(
-                "Failed to launch MCP server '" + config.command + "': " +
-                std::strerror(launch_error));
-        }
-
-        ::close(stdin_pipe[0]);
-        ::close(stdout_pipe[1]);
-        ::close(stderr_pipe[1]);
-#else
         const pid_t child = ::fork();
         if (child < 0) {
             const int error = errno;
@@ -1248,7 +1089,6 @@ private:
                 std::string("Failed to verify MCP exec: ") +
                 std::strerror(error));
         }
-#endif
 
         pid_ = child;
         stdin_write_ = stdin_pipe[1];

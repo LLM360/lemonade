@@ -531,8 +531,8 @@ public:
     }
 
     // Mark observable backend progress. Streaming proxies call this for every
-    // nonempty successful backend body chunk; non-streaming requests call it
-    // on start/finish and when the watchdog observes a healthy out-of-band probe.
+    // delivered chunk; non-streaming requests call it on start/finish and when
+    // the watchdog observes a healthy out-of-band probe.
     void note_backend_activity();
 
     void set_telemetry(int input_tokens, int output_tokens,
@@ -611,15 +611,6 @@ protected:
 
     // Common method to forward requests to the wrapped server (non-streaming)
     json forward_request(const std::string& endpoint, const json& request, long timeout_seconds = 0);
-
-    void forward_streaming_request_impl(
-        const std::string& endpoint,
-        const std::string& request_body,
-        httplib::DataSink& sink,
-        bool sse,
-        long timeout_seconds,
-        TelemetryCallback telemetry_callback,
-        StreamingProxy::SseFrameTransform frame_transform);
 
     json forward_get_request(const std::string& endpoint, long timeout_seconds = 0);
 

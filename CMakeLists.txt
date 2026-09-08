@@ -1192,16 +1192,6 @@ if(BUILD_TESTING AND EXISTS "${MCP_CLIENT_CONFIG_TEST_SOURCE}")
     )
     target_link_libraries(test_mcp_client_config PRIVATE lemonade-server-core)
 
-    if(NOT WIN32)
-        set_property(SOURCE src/cpp/server/mcp_client.cpp APPEND PROPERTY
-            COMPILE_DEFINITIONS
-            LEMONADE_MCP_PROCESS_TEST_HOOK
-        )
-        target_compile_definitions(test_mcp_client_config PRIVATE
-            LEMONADE_MCP_PROCESS_TEST_HOOK
-        )
-    endif()
-
     if(Python3_Interpreter_FOUND AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/mock_mcp_stdio_server.py")
         file(TO_CMAKE_PATH "${Python3_EXECUTABLE}" LEMONADE_TEST_PYTHON_PATH)
         file(TO_CMAKE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/test/fixtures/mock_mcp_stdio_server.py" LEMONADE_TEST_MCP_STDIO_SERVER_PATH)
@@ -1211,20 +1201,6 @@ if(BUILD_TESTING AND EXISTS "${MCP_CLIENT_CONFIG_TEST_SOURCE}")
     endif()
 
     add_cpp_ci_test(mcp_client_config CI ON COMMAND test_mcp_client_config)
-endif()
-
-set(MCP_CLIENT_PROCESS_CONTRACT_TEST_SOURCE
-    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_mcp_client_process_contract.cpp"
-)
-if(BUILD_TESTING AND EXISTS "${MCP_CLIENT_PROCESS_CONTRACT_TEST_SOURCE}")
-    add_executable(test_mcp_client_process_contract
-        ${MCP_CLIENT_PROCESS_CONTRACT_TEST_SOURCE}
-    )
-    target_compile_definitions(test_mcp_client_process_contract PRIVATE
-        "LEMONADE_MCP_CLIENT_SOURCE=\"${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/server/mcp_client.cpp\""
-    )
-    add_cpp_ci_test(mcp_client_process_contract CI ON
-                    COMMAND test_mcp_client_process_contract)
 endif()
 
 # libwebsockets for the realtime and log-stream WebSocket server
@@ -2254,55 +2230,25 @@ if(BUILD_TESTING AND EXISTS "${_ARCHIVE_PLATFORM_TEST_SRC}")
     add_cpp_ci_test(ArchivePlatformTest CI ON COMMAND test_archive_platform)
 endif()
 
-# ProcessManager lifecycle and output-capture contracts.
-if(BUILD_TESTING AND (CMAKE_SYSTEM_NAME STREQUAL "Linux" OR
-                      CMAKE_SYSTEM_NAME STREQUAL "Darwin"))
+# ProcessManager zombie detection and non-mutating reap contract.
+if(BUILD_TESTING AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(_PROCESS_MANAGER_TEST_SRC
         "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_process_manager.cpp"
     )
     if(EXISTS "${_PROCESS_MANAGER_TEST_SRC}")
-        if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-            set(_PROCESS_MANAGER_PLATFORM_SRC
-                src/cpp/server/utils/platform/process_linux.cpp
-            )
-        else()
-            set(_PROCESS_MANAGER_PLATFORM_SRC
-                src/cpp/server/utils/platform/process_macos.cpp
-            )
-        endif()
         add_executable(test_process_manager
             test/cpp/test_process_manager.cpp
             src/cpp/server/utils/process_manager.cpp
-            ${_PROCESS_MANAGER_PLATFORM_SRC}
+            src/cpp/server/utils/platform/process_linux.cpp
         )
         target_include_directories(test_process_manager PRIVATE
             ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
             ${CMAKE_CURRENT_BINARY_DIR}/include
         )
-        target_compile_definitions(test_process_manager PRIVATE
-            LEMONADE_PROCESS_TEST_HOOK
-        )
         find_package(Threads REQUIRED)
         target_link_libraries(test_process_manager PRIVATE Threads::Threads)
         add_cpp_ci_test(ProcessManagerTest CI ON COMMAND test_process_manager)
     endif()
-endif()
-
-set(_PROCESS_MANAGER_WINDOWS_TEST_SRC
-    "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_process_manager_windows.cpp"
-)
-if(BUILD_TESTING AND WIN32 AND EXISTS "${_PROCESS_MANAGER_WINDOWS_TEST_SRC}")
-    add_executable(test_process_manager_windows
-        test/cpp/test_process_manager_windows.cpp
-        src/cpp/server/utils/process_manager.cpp
-        src/cpp/server/utils/platform/process_windows.cpp
-    )
-    target_include_directories(test_process_manager_windows PRIVATE
-        ${CMAKE_CURRENT_SOURCE_DIR}/src/cpp/include
-        ${CMAKE_CURRENT_BINARY_DIR}/include
-    )
-    add_cpp_ci_test(ProcessManagerWindowsTest CI ON
-                    COMMAND test_process_manager_windows)
 endif()
 
 # FastFlowLM argument validation. Keep this test independent from the server
@@ -3274,13 +3220,6 @@ if(BUILD_TESTING AND EXISTS "${_STREAMING_PROXY_CANCEL_TEST_SRC}")
     add_executable(test_streaming_proxy_cancel test/cpp/test_streaming_proxy_cancel.cpp)
     target_link_libraries(test_streaming_proxy_cancel PRIVATE lemonade-server-core)
     add_cpp_ci_test(StreamingProxyCancelTest CI OFF COMMAND test_streaming_proxy_cancel)
-endif()
-
-set(_LLAMACPP_STREAM_MODEL_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_llamacpp_stream_model.cpp")
-if(BUILD_TESTING AND EXISTS "${_LLAMACPP_STREAM_MODEL_TEST_SRC}")
-    add_executable(test_llamacpp_stream_model test/cpp/test_llamacpp_stream_model.cpp)
-    target_link_libraries(test_llamacpp_stream_model PRIVATE lemonade-server-core)
-    add_cpp_ci_test(LlamaCppStreamModelTest CI ON COMMAND test_llamacpp_stream_model)
 endif()
 
 set(_STREAMING_HEARTBEAT_TEST_SRC "${CMAKE_CURRENT_SOURCE_DIR}/test/cpp/test_streaming_heartbeat.cpp")

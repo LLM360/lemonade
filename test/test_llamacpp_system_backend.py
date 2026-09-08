@@ -55,8 +55,8 @@ def get_arg(flag, default):
 
 
 # lemond detects the system llama-server version by running
-# `llama-server --version` and reading bounded output from the llamacpp backend
-# resolver in src/cpp/server/backends/llamacpp/llamacpp_server.cpp.
+# `llama-server --version` and reading one line of stdout from the llamacpp
+# backend resolver in src/cpp/server/backends/llamacpp/llamacpp_server.cpp.
 # The real binary prints a version line and exits immediately. We must mirror
 # that: otherwise the probe blocks forever on our long-lived HTTP server and
 # /internal/set hangs until the client times out.
@@ -166,69 +166,6 @@ class Handler(BaseHTTPRequestHandler):
 
 
 ReusableHTTPServer(("127.0.0.1", port), Handler).serve_forever()
-"""
-
-MOCK_INCOMPATIBLE_LLAMA_SERVER_PYTHON = """#!/usr/bin/env python3
-import os
-import sys
-
-if "--version" in sys.argv or "--help" in sys.argv:
-    print("version: 0.3.0-dev (build 4242, commit incompatible)")
-    sys.exit(0)
-
-invocation_path = os.environ.get("MOCK_LLAMA_INVOCATION_PATH", "")
-if invocation_path:
-    with open(invocation_path, "a", encoding="utf-8") as handle:
-        handle.write("model\\n")
-
-if "--log-file" in sys.argv:
-    print("error: unrecognized argument: --log-file", file=sys.stderr)
-    sys.exit(2)
-
-message = "error loading model: unknown model architecture: 'k2-horizon'"
-print(message, file=sys.stderr)
-sys.exit(1)
-"""
-
-MOCK_RESOURCE_FAILURE_LLAMA_SERVER_PYTHON = """#!/usr/bin/env python3
-import os
-import sys
-
-if "--version" in sys.argv or "--help" in sys.argv:
-    print("version: 0.3.0-dev (build 4242, commit incompatible)")
-    sys.exit(0)
-
-invocation_path = os.environ.get("MOCK_LLAMA_INVOCATION_PATH", "")
-if invocation_path:
-    with open(invocation_path, "a", encoding="utf-8") as handle:
-        handle.write("model\\n")
-
-message = "error loading model: failed to allocate compute buffers"
-print(message, file=sys.stderr)
-sys.exit(1)
-"""
-
-MOCK_CANCELLABLE_LLAMA_SERVER_PYTHON = """#!/usr/bin/env python3
-import os
-import sys
-import time
-
-if "--version" in sys.argv or "--help" in sys.argv:
-    print("version: 0.3.0-dev (build 4242, commit incompatible)")
-    sys.exit(0)
-
-invocation_path = os.environ.get("MOCK_LLAMA_INVOCATION_PATH", "")
-if invocation_path:
-    with open(invocation_path, "a", encoding="utf-8") as handle:
-        handle.write("model\\n")
-
-print(
-    "error loading model: unknown model architecture: 'k2-horizon'",
-    file=sys.stderr,
-    flush=True,
-)
-while True:
-    time.sleep(1)
 """
 
 
@@ -396,24 +333,15 @@ class LlamaCppSystemBackendTests(unittest.TestCase):
         cls.temp_bin_dir = tempfile.mkdtemp(prefix="lemonade_llamacpp_mock_bin_")
         cls.cache_dir = tempfile.mkdtemp(prefix="lemonade_llamacpp_test_")
         cls.dummy_llama_server_path = os.path.join(cls.temp_bin_dir, "llama-server")
-        cls.k2_fixture_path = os.path.join(cls.temp_bin_dir, "k2-system-fixture.bin")
         cls.capture_path = os.path.join(cls.temp_bin_dir, "captured_chat_request.json")
         cls.control_path = os.path.join(cls.temp_bin_dir, "mock_control.json")
-        cls.invocation_path = os.path.join(cls.temp_bin_dir, "model_invocations.txt")
         cls.original_env = {
             name: os.environ.get(name)
-            for name in (
-                "PATH",
-                "MOCK_LLAMA_REQUEST_PATH",
-                "MOCK_LLAMA_CONTROL_PATH",
-                "MOCK_LLAMA_INVOCATION_PATH",
-            )
+            for name in ("PATH", "MOCK_LLAMA_REQUEST_PATH", "MOCK_LLAMA_CONTROL_PATH")
         }
 
         try:
             cls._write_llama_server(MOCK_LLAMA_SERVER_PYTHON)
-            with open(cls.k2_fixture_path, "wb") as handle:
-                handle.write(b"GGUF")
 
             # Keep the external-system integration deterministic on AMD hosts as
             # well: production accepts the plugin beside a PATH llama-server.
@@ -431,7 +359,6 @@ class LlamaCppSystemBackendTests(unittest.TestCase):
             os.environ["PATH"] = cls.temp_bin_dir + os.pathsep + original_path
             os.environ["MOCK_LLAMA_REQUEST_PATH"] = cls.capture_path
             os.environ["MOCK_LLAMA_CONTROL_PATH"] = cls.control_path
-            os.environ["MOCK_LLAMA_INVOCATION_PATH"] = cls.invocation_path
             cls._write_mock_control({})
 
             # One lemond and one spawned mock llama-server are enough for all
@@ -490,64 +417,10 @@ class LlamaCppSystemBackendTests(unittest.TestCase):
         with open(cls.control_path, "w", encoding="utf-8") as handle:
             json.dump(control, handle)
 
-    @classmethod
-    def _model_invocation_count(cls):
-        try:
-            with open(cls.invocation_path, "r", encoding="utf-8") as handle:
-                return sum(1 for line in handle if line.strip() == "model")
-        except FileNotFoundError:
-            return 0
-
-    @classmethod
-    def _wait_for_model_invocations(cls, expected, timeout=10):
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            if cls._model_invocation_count() >= expected:
-                return True
-            time.sleep(0.05)
-        return cls._model_invocation_count() >= expected
-
-    @staticmethod
-    def _wait_for_job_status(job_id, expected, timeout=20):
-        deadline = time.time() + timeout
-        last_status = None
-        while time.time() < deadline:
-            response = requests.get(
-                f"http://localhost:{PORT}/api/v1/jobs/{job_id}",
-                timeout=TIMEOUT_DEFAULT,
-            )
-            if response.status_code == 200:
-                last_status = response.json().get("status")
-                if last_status == expected:
-                    return response.json()
-            time.sleep(0.1)
-        raise AssertionError(
-            f"job {job_id} did not reach {expected}; last status={last_status}"
-        )
-
-    def _register_k2_system_fixture(self):
-        k2_fixture = "user.K2-Horizon-System-Binary-Fixture"
-        registration = requests.post(
-            f"http://localhost:{PORT}/api/v1/models/register",
-            json={
-                "model_name": k2_fixture,
-                "recipe": "llamacpp",
-                "checkpoint": self.k2_fixture_path,
-                "source": "local_path",
-                "labels": ["chat", "reasoning", "tool-calling"],
-            },
-            timeout=TIMEOUT_DEFAULT,
-        )
-        self.assertEqual(registration.status_code, 200, registration.text)
-        self.assertTrue(registration.json()["model"]["downloaded"])
-        return k2_fixture
-
     def setUp(self):
         print(f"\n=== Starting test: {self._testMethodName} ===")
         if os.path.exists(self.capture_path):
             os.remove(self.capture_path)
-        if os.path.exists(self.invocation_path):
-            os.remove(self.invocation_path)
         self._write_mock_control({})
 
     @unittest.skipUnless(
@@ -678,160 +551,6 @@ class LlamaCppSystemBackendTests(unittest.TestCase):
         self.assertEqual(error["code"], "context_length_exceeded")
         self.assertEqual(error["status_code"], 400)
         self.assertIn("exceeds the available context size", error["message"])
-
-    @unittest.skipUnless(
-        sys.platform.startswith("linux"), "System backend only supported on Linux"
-    )
-    def test_009_incompatible_system_binary_has_actionable_k2_diagnostic(self):
-        k2_fixture = self._register_k2_system_fixture()
-
-        unload_response = requests.post(
-            f"http://localhost:{PORT}/api/v1/unload",
-            json={},
-            timeout=TIMEOUT_DEFAULT,
-        )
-        self.assertEqual(unload_response.status_code, 200, unload_response.text)
-
-        self._write_llama_server(MOCK_INCOMPATIBLE_LLAMA_SERVER_PYTHON)
-        try:
-            ordinary_response = requests.post(
-                f"http://localhost:{PORT}/api/v1/load",
-                json={
-                    "model_name": ENDPOINT_TEST_MODEL,
-                    "llamacpp_backend": "system",
-                },
-                timeout=TIMEOUT_MODEL_OPERATION,
-            )
-            self.assertNotEqual(ordinary_response.status_code, 200)
-            ordinary_message = ordinary_response.json()["error"]["message"]
-            self.assertTrue(
-                ordinary_message.endswith(": llama-server failed to start"),
-                ordinary_message,
-            )
-            self.assertNotIn("K2-Horizon-capable", ordinary_message)
-            self.assertEqual(self._model_invocation_count(), 2)
-
-            os.remove(self.invocation_path)
-
-            k2_response = requests.post(
-                f"http://localhost:{PORT}/api/v1/load",
-                json={"model_name": k2_fixture, "llamacpp_backend": "system"},
-                timeout=TIMEOUT_MODEL_OPERATION,
-            )
-            self.assertNotEqual(k2_response.status_code, 200)
-            message = k2_response.json()["error"]["message"]
-            self.assertIn(k2_fixture, message)
-            self.assertIn(self.dummy_llama_server_path, message)
-            self.assertIn("b4242", message)
-            self.assertIn(
-                "Original error: error loading model: unknown model architecture: "
-                "'k2-horizon'",
-                message,
-            )
-            self.assertIn("K2-Horizon-capable", message)
-            self.assertIn("model/K2Horizon", message)
-            self.assertIn("PATH", message)
-            self.assertEqual(
-                self._model_invocation_count(),
-                2,
-                "diagnostic collection must not re-launch the model command",
-            )
-        finally:
-            self._write_llama_server(MOCK_LLAMA_SERVER_PYTHON)
-
-    @unittest.skipUnless(
-        sys.platform.startswith("linux"), "System backend only supported on Linux"
-    )
-    def test_010_k2_resource_failure_keeps_ordinary_startup_diagnostic(self):
-        k2_fixture = self._register_k2_system_fixture()
-        unload_response = requests.post(
-            f"http://localhost:{PORT}/api/v1/unload",
-            json={},
-            timeout=TIMEOUT_DEFAULT,
-        )
-        self.assertEqual(unload_response.status_code, 200, unload_response.text)
-
-        self._write_llama_server(MOCK_RESOURCE_FAILURE_LLAMA_SERVER_PYTHON)
-        try:
-            response = requests.post(
-                f"http://localhost:{PORT}/api/v1/load",
-                json={"model_name": k2_fixture, "llamacpp_backend": "system"},
-                timeout=TIMEOUT_MODEL_OPERATION,
-            )
-            self.assertNotEqual(response.status_code, 200)
-            message = response.json()["error"]["message"]
-            self.assertTrue(
-                message.endswith(": llama-server failed to start"),
-                message,
-            )
-            self.assertNotIn("K2-Horizon-capable", message)
-            self.assertNotIn("model/K2Horizon", message)
-            self.assertEqual(
-                self._model_invocation_count(),
-                2,
-                "resource failure diagnosis must not repeat the model command",
-            )
-        finally:
-            self._write_llama_server(MOCK_LLAMA_SERVER_PYTHON)
-
-    @unittest.skipUnless(
-        sys.platform.startswith("linux"), "System backend only supported on Linux"
-    )
-    def test_011_cancelled_k2_load_does_not_relaunch_model_command(self):
-        k2_fixture = self._register_k2_system_fixture()
-        unload_response = requests.post(
-            f"http://localhost:{PORT}/api/v1/unload",
-            json={},
-            timeout=TIMEOUT_DEFAULT,
-        )
-        self.assertEqual(unload_response.status_code, 200, unload_response.text)
-
-        job_id = None
-        self._write_llama_server(MOCK_CANCELLABLE_LLAMA_SERVER_PYTHON)
-        try:
-            response = requests.post(
-                f"http://localhost:{PORT}/api/v1/jobs",
-                json={
-                    "name": "cancel-k2-system-load",
-                    "definition": {
-                        "steps": [
-                            {
-                                "id": "load",
-                                "op": "load",
-                                "params": {
-                                    "model": k2_fixture,
-                                    "llamacpp_backend": "system",
-                                },
-                            }
-                        ]
-                    },
-                },
-                timeout=TIMEOUT_DEFAULT,
-            )
-            self.assertEqual(response.status_code, 202, response.text)
-            job_id = response.json()["id"]
-            self.assertTrue(self._wait_for_model_invocations(1))
-
-            interrupt_response = requests.post(
-                f"http://localhost:{PORT}/api/v1/jobs/{job_id}/interrupt",
-                timeout=TIMEOUT_DEFAULT,
-            )
-            self.assertEqual(
-                interrupt_response.status_code, 200, interrupt_response.text
-            )
-            self._wait_for_job_status(job_id, "interrupted")
-            self.assertEqual(
-                self._model_invocation_count(),
-                1,
-                "a cancelled load must not retry or replay the model command",
-            )
-        finally:
-            if job_id is not None:
-                requests.delete(
-                    f"http://localhost:{PORT}/api/v1/jobs/{job_id}",
-                    timeout=TIMEOUT_DEFAULT,
-                )
-            self._write_llama_server(MOCK_LLAMA_SERVER_PYTHON)
 
 
 def _run_tests():

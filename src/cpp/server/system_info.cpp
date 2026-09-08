@@ -2398,9 +2398,12 @@ static std::vector<NvidiaSmiGpuInfo> query_nvidia_smi() {
         " --format=csv,noheader,nounits 2>/dev/null";
     for (const char* smi : {"nvidia-smi", "/usr/bin/nvidia-smi"}) {
         std::string cmd = std::string(smi) + smi_query;
+        FILE* pipe = popen(cmd.c_str(), "r");
+        if (!pipe) continue;
         std::string candidate;
-        const int rc = lemon::utils::ProcessManager::run_command(
-            cmd, candidate, 10);
+        char buffer[512];
+        while (fgets(buffer, sizeof(buffer), pipe) != nullptr) candidate += buffer;
+        int rc = pclose(pipe);
         if (rc == 0 && !candidate.empty()) {
             output = candidate;
             break;
@@ -3052,7 +3055,7 @@ CPUInfo LinuxSystemInfo::get_cpu_device() {
     cpu.available = false;
 
     // Execute lscpu command
-    FILE* pipe = popen("lscpu 2>/dev/null", "re");
+    FILE* pipe = popen("lscpu 2>/dev/null", "r");
     if (!pipe) {
         cpu.error = "Failed to execute lscpu command";
         return cpu;
@@ -3265,7 +3268,7 @@ std::vector<GPUInfo> LinuxSystemInfo::get_nvidia_gpu_devices() {
     }
 
     // Fallback: lspci (for systems where nvidia-smi is unavailable)
-    FILE* pipe = popen("lspci 2>/dev/null | grep -iE 'vga|3d|display'", "re");
+    FILE* pipe = popen("lspci 2>/dev/null | grep -iE 'vga|3d|display'", "r");
     if (!pipe) {
         GPUInfo gpu;
         gpu.available = false;
@@ -3516,7 +3519,7 @@ std::vector<GPUInfo> LinuxSystemInfo::detect_amd_gpus(const std::string& gpu_typ
 
 std::string LinuxSystemInfo::get_nvidia_driver_version() {
     // Try nvidia-smi first
-    FILE* pipe = popen("nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits 2>/dev/null", "re");
+    FILE* pipe = popen("nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits 2>/dev/null", "r");
     if (pipe) {
         char buffer[128];
         if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
@@ -3565,7 +3568,7 @@ std::string LinuxSystemInfo::get_nvidia_driver_version() {
 }
 
 double LinuxSystemInfo::get_nvidia_vram() {
-    FILE* pipe = popen("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null", "re");
+    FILE* pipe = popen("nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits 2>/dev/null", "r");
     if (!pipe) {
         return 0.0;
     }
@@ -3701,7 +3704,7 @@ std::string LinuxSystemInfo::get_os_version() {
 }
 
 std::string LinuxSystemInfo::get_processor_name() {
-    FILE* pipe = popen("lscpu 2>/dev/null", "re");
+    FILE* pipe = popen("lscpu 2>/dev/null", "r");
     if (!pipe) {
         return "ERROR - Failed to execute lscpu";
     }
@@ -3852,17 +3855,20 @@ std::string MacOSSystemInfo::get_os_version() {
     std::string result = "macOS";
 
     // Get macOS product version (e.g., "14.3.1")
-    std::string version;
-    if (lemon::utils::ProcessManager::run_command(
-            "sw_vers -productVersion 2>/dev/null", version, 5) == 0) {
-        // Trim trailing newline
-        while (!version.empty() &&
-               (version.back() == '\n' || version.back() == '\r')) {
-            version.pop_back();
+    FILE* pipe = popen("sw_vers -productVersion 2>/dev/null", "r");
+    if (pipe) {
+        char buffer[128];
+        if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+            std::string version = buffer;
+            // Trim trailing newline
+            while (!version.empty() && (version.back() == '\n' || version.back() == '\r')) {
+                version.pop_back();
+            }
+            if (!version.empty()) {
+                result += " " + version;
+            }
         }
-        if (!version.empty()) {
-            result += " " + version;
-        }
+        pclose(pipe);
     }
 
     // Append Darwin kernel version

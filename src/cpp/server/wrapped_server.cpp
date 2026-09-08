@@ -6,11 +6,10 @@
 #include <httplib.h>
 #include <algorithm>
 #include <cctype>
-#include <chrono>
-#include <cstdlib>
-#include <iostream>
 #include <thread>
-#include <utility>
+#include <chrono>
+#include <iostream>
+#include <cstdlib>
 #include <lemon/utils/aixlog.hpp>
 
 namespace lemon {
@@ -793,19 +792,6 @@ void WrappedServer::forward_streaming_request(const std::string& endpoint,
                                               bool sse,
                                               long timeout_seconds,
                                               TelemetryCallback telemetry_callback) {
-    forward_streaming_request_impl(
-        endpoint, request_body, sink, sse, timeout_seconds,
-        std::move(telemetry_callback), nullptr);
-}
-
-void WrappedServer::forward_streaming_request_impl(
-    const std::string& endpoint,
-    const std::string& request_body,
-    httplib::DataSink& sink,
-    bool sse,
-    long timeout_seconds,
-    TelemetryCallback telemetry_callback,
-    StreamingProxy::SseFrameTransform frame_transform) {
     if (!is_backend_alive()) {
         if (was_watchdog_triggered() || has_backend_process_exited()) {
             if (!was_watchdog_triggered()) {
@@ -825,19 +811,12 @@ void WrappedServer::forward_streaming_request_impl(
 
     std::string url = get_base_url() + endpoint;
     bool streamed_any_bytes = false;
-    auto mark_client_delivery = [this, &streamed_any_bytes]() {
+    auto mark_stream_progress = [this, &streamed_any_bytes]() {
         if (!streamed_any_bytes) {
             set_streaming(true);
         }
         streamed_any_bytes = true;
-    };
-    auto mark_backend_progress = [this]() {
         note_backend_activity();
-    };
-    auto mark_byte_stream_progress = [&mark_client_delivery,
-                                     &mark_backend_progress]() {
-        mark_client_delivery();
-        mark_backend_progress();
     };
 
     try {
@@ -845,26 +824,18 @@ void WrappedServer::forward_streaming_request_impl(
         if (sse) {
             // Use StreamingProxy to forward the SSE stream with telemetry callback
             // Use INFERENCE_TIMEOUT_SECONDS (0 = infinite) as chat completions can take a long time
-            auto report_telemetry = [telemetry_callback](
-                                        const StreamingProxy::TelemetryData& telemetry) {
-                if (telemetry_callback) {
-                    telemetry_callback(telemetry);
-                }
-            };
-            if (frame_transform) {
-                StreamingProxy::forward_transformed_sse_stream(
-                    url, request_body, sink, frame_transform, report_telemetry,
-                    timeout_seconds, mark_backend_progress, 1000,
-                    mark_client_delivery);
-            } else {
-                StreamingProxy::forward_sse_stream(
-                    url, request_body, sink, report_telemetry,
-                    timeout_seconds, mark_backend_progress, 1000,
-                    mark_client_delivery);
-            }
+            StreamingProxy::forward_sse_stream(url, request_body, sink,
+                [telemetry_callback](const StreamingProxy::TelemetryData& telemetry) {
+                    if (telemetry_callback) {
+                        telemetry_callback(telemetry);
+                    }
+                },
+                timeout_seconds,
+                mark_stream_progress
+            );
         } else {
             StreamingProxy::forward_byte_stream(url, request_body, sink, timeout_seconds,
-                mark_byte_stream_progress
+                mark_stream_progress
             );
         }
     } catch (const std::exception& e) {

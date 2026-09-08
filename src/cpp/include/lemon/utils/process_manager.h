@@ -1,36 +1,15 @@
 #pragma once
 
-#include <condition_variable>
-#include <cstddef>
-#include <functional>
-#include <memory>
-#include <mutex>
 #include <string>
 #include <vector>
+#include <functional>
 
 namespace lemon {
 namespace utils {
 
-class ProcessOutputCapture {
-public:
-    explicit ProcessOutputCapture(std::size_t max_bytes);
-
-    void append(const char* data, std::size_t size);
-    void finish_reader();
-    std::string read_tail(std::size_t max_bytes, int wait_timeout_ms);
-
-private:
-    const std::size_t max_bytes_;
-    std::mutex mutex_;
-    std::condition_variable completion_cv_;
-    std::string tail_;
-    int active_readers_ = 2;
-};
-
 struct ProcessHandle {
     void* handle;
     int pid;
-    std::shared_ptr<ProcessOutputCapture> output_capture;
 };
 
 // Returns true to continue, false to kill the process
@@ -44,8 +23,7 @@ public:
         const std::string& working_dir = "",
         bool inherit_output = false,
         bool filter_health_logs = false,
-        const std::vector<std::pair<std::string, std::string>>& env_vars = {},
-        std::size_t capture_output_bytes = 0);
+        const std::vector<std::pair<std::string, std::string>>& env_vars = {});
 
     // Blocks until process exits or callback returns false (which kills the process)
     // Returns exit code, or -1 if killed by callback
@@ -74,9 +52,7 @@ public:
     // read-only while lifecycle cleanup can reliably remove zombies.
     static int reap_process(ProcessHandle handle);
 
-    static std::string read_output(ProcessHandle handle,
-                                   int max_bytes = 4096,
-                                   int wait_timeout_ms = 1000);
+    static std::string read_output(ProcessHandle handle, int max_bytes = 4096);
 
     // Kill process forcefully and wait/close owned handles.
     static void kill_process(ProcessHandle handle);

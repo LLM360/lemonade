@@ -22,9 +22,8 @@
 #include <algorithm>
 #include <cctype>
 #include <chrono>
-#include <new>
-#include <stdexcept>
 #include <thread>
+#include <stdexcept>
 
 namespace lemon {
 namespace utils {
@@ -50,164 +49,6 @@ static std::string escape_windows_arg(const std::string& arg) {
     }
     result += "\"";
     return result;
-}
-
-static BOOL create_process_with_restricted_handles(
-    LPSTR command_line,
-    DWORD creation_flags,
-    LPVOID environment,
-    LPCSTR working_directory,
-    const STARTUPINFOA& startup_info,
-    PROCESS_INFORMATION* process_information) {
-    STARTUPINFOEXA extended_startup_info{};
-    extended_startup_info.StartupInfo = startup_info;
-
-    HANDLE source_handles[] = {
-        startup_info.hStdInput,
-        startup_info.hStdOutput,
-        startup_info.hStdError,
-    };
-    HANDLE fallback_handles[3] = {};
-    HANDLE unique_source_handles[3] = {};
-    HANDLE inherited_handles[3] = {};
-    DWORD inherited_handle_count = 0;
-    SIZE_T attribute_list_size = 0;
-    void* attribute_storage = nullptr;
-    bool attribute_list_initialized = false;
-    auto cleanup = [&]() {
-        if (attribute_list_initialized) {
-            DeleteProcThreadAttributeList(
-                extended_startup_info.lpAttributeList);
-        }
-        if (attribute_storage != nullptr) {
-            HeapFree(GetProcessHeap(), 0, attribute_storage);
-        }
-        for (DWORD i = 0; i < inherited_handle_count; ++i) {
-            CloseHandle(inherited_handles[i]);
-        }
-        for (DWORD i = 0; i < 3; ++i) {
-            if (fallback_handles[i] != nullptr &&
-                fallback_handles[i] != INVALID_HANDLE_VALUE) {
-                CloseHandle(fallback_handles[i]);
-            }
-        }
-    };
-
-    if ((startup_info.dwFlags & STARTF_USESTDHANDLES) != 0) {
-        for (DWORD i = 0; i < 3; ++i) {
-            bool usable = source_handles[i] != nullptr &&
-                          source_handles[i] != INVALID_HANDLE_VALUE;
-            if (usable) {
-                SetLastError(ERROR_SUCCESS);
-                const DWORD type = GetFileType(source_handles[i]);
-                usable = type != FILE_TYPE_UNKNOWN ||
-                         GetLastError() == ERROR_SUCCESS;
-            }
-            if (usable) {
-                continue;
-            }
-
-            const DWORD access = i == 0 ? GENERIC_READ : GENERIC_WRITE;
-            const HANDLE fallback = CreateFileA(
-                "NUL", access, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr,
-                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (fallback == INVALID_HANDLE_VALUE) {
-                const DWORD error = GetLastError();
-                cleanup();
-                SetLastError(error);
-                return FALSE;
-            }
-            fallback_handles[i] = fallback;
-            source_handles[i] = fallback;
-        }
-
-        for (DWORD i = 0; i < 3; ++i) {
-            const HANDLE source = source_handles[i];
-            DWORD existing = 0;
-            while (existing < inherited_handle_count &&
-                   unique_source_handles[existing] != source) {
-                ++existing;
-            }
-
-            HANDLE inherited = nullptr;
-            if (existing < inherited_handle_count) {
-                inherited = inherited_handles[existing];
-            } else {
-                if (!DuplicateHandle(
-                        GetCurrentProcess(), source, GetCurrentProcess(),
-                        &inherited, 0, TRUE, DUPLICATE_SAME_ACCESS)) {
-                    const DWORD error = GetLastError();
-                    cleanup();
-                    SetLastError(error);
-                    return FALSE;
-                }
-                unique_source_handles[inherited_handle_count] = source;
-                inherited_handles[inherited_handle_count] = inherited;
-                ++inherited_handle_count;
-            }
-
-            if (i == 0) {
-                extended_startup_info.StartupInfo.hStdInput = inherited;
-            } else if (i == 1) {
-                extended_startup_info.StartupInfo.hStdOutput = inherited;
-            } else {
-                extended_startup_info.StartupInfo.hStdError = inherited;
-            }
-        }
-    }
-
-    BOOL inherit_handles = FALSE;
-    DWORD effective_creation_flags = creation_flags;
-    if (inherited_handle_count > 0) {
-        InitializeProcThreadAttributeList(
-            nullptr, 1, 0, &attribute_list_size);
-        if (attribute_list_size == 0) {
-            const DWORD error = GetLastError();
-            cleanup();
-            SetLastError(error);
-            return FALSE;
-        }
-
-        attribute_storage =
-            HeapAlloc(GetProcessHeap(), 0, attribute_list_size);
-        if (attribute_storage == nullptr) {
-            cleanup();
-            SetLastError(ERROR_NOT_ENOUGH_MEMORY);
-            return FALSE;
-        }
-        extended_startup_info.lpAttributeList =
-            static_cast<LPPROC_THREAD_ATTRIBUTE_LIST>(attribute_storage);
-        if (!InitializeProcThreadAttributeList(
-                extended_startup_info.lpAttributeList, 1, 0,
-                &attribute_list_size)) {
-            const DWORD error = GetLastError();
-            cleanup();
-            SetLastError(error);
-            return FALSE;
-        }
-        attribute_list_initialized = true;
-        if (!UpdateProcThreadAttribute(
-                extended_startup_info.lpAttributeList, 0,
-                PROC_THREAD_ATTRIBUTE_HANDLE_LIST, inherited_handles,
-                inherited_handle_count * sizeof(HANDLE), nullptr, nullptr)) {
-            const DWORD error = GetLastError();
-            cleanup();
-            SetLastError(error);
-            return FALSE;
-        }
-        extended_startup_info.StartupInfo.cb = sizeof(STARTUPINFOEXA);
-        effective_creation_flags |= EXTENDED_STARTUPINFO_PRESENT;
-        inherit_handles = TRUE;
-    }
-
-    const BOOL success = CreateProcessA(
-        nullptr, command_line, nullptr, nullptr, inherit_handles,
-        effective_creation_flags, environment, working_directory,
-        &extended_startup_info.StartupInfo, process_information);
-    const DWORD error = success ? ERROR_SUCCESS : GetLastError();
-    cleanup();
-    SetLastError(error);
-    return success;
 }
 
 // Helper function to check if a line should be filtered
@@ -241,77 +82,34 @@ static void log_process_line(const std::string& line) {
     }
 }
 
-struct OutputReaderContext {
-    HANDLE pipe;
-    bool log_output;
-    std::shared_ptr<ProcessOutputCapture> output_capture;
-};
-
+// Thread function to read from pipe and filter output
 static DWORD WINAPI output_filter_thread(LPVOID param) {
-    std::unique_ptr<OutputReaderContext> context(
-        static_cast<OutputReaderContext*>(param));
+    HANDLE pipe = static_cast<HANDLE>(param);
     char buffer[4096];
     DWORD bytes_read;
     std::string line_buffer;
 
-    while (ReadFile(context->pipe, buffer, sizeof(buffer), &bytes_read, nullptr) &&
-           bytes_read > 0) {
-        if (context->output_capture) {
-            context->output_capture->append(
-                buffer, static_cast<std::size_t>(bytes_read));
-        }
-        if (!context->log_output) {
-            continue;
-        }
+    while (ReadFile(pipe, buffer, sizeof(buffer) - 1, &bytes_read, nullptr) && bytes_read > 0) {
+        buffer[bytes_read] = '\0';
+        line_buffer += buffer;
 
-        line_buffer.append(buffer, static_cast<std::size_t>(bytes_read));
-
+        // Process complete lines
         size_t pos;
         while ((pos = line_buffer.find('\n')) != std::string::npos) {
             std::string line = line_buffer.substr(0, pos);
-            line_buffer.erase(0, pos + 1);
+            line_buffer = line_buffer.substr(pos + 1);
+
             log_process_line(line);
         }
     }
 
-    if (context->log_output && !line_buffer.empty()) {
+    // Print any remaining partial line
+    if (!line_buffer.empty()) {
         log_process_line(line_buffer);
-    }
-    CloseHandle(context->pipe);
-    if (context->output_capture) {
-        context->output_capture->finish_reader();
-    }
-    return 0;
-}
-
-static void start_output_reader(
-    HANDLE pipe,
-    bool log_output,
-    const std::shared_ptr<ProcessOutputCapture>& output_capture) {
-    auto* context =
-        new (std::nothrow) OutputReaderContext{pipe, log_output, output_capture};
-    if (context == nullptr) {
-        CloseHandle(pipe);
-        if (output_capture) {
-            output_capture->finish_reader();
-        }
-        LOG(ERROR, "ProcessManager")
-            << "Failed to allocate process output reader context" << std::endl;
-        return;
-    }
-
-    HANDLE thread = CreateThread(
-        nullptr, 0, output_filter_thread, context, 0, nullptr);
-    if (thread != nullptr) {
-        CloseHandle(thread);
-        return;
     }
 
     CloseHandle(pipe);
-    if (output_capture) {
-        output_capture->finish_reader();
-    }
-    delete context;
+    return 0;
 }
 
 // Helper function: lowercase ASCII string for case-insensitive comparison
@@ -382,13 +180,11 @@ public:
         const std::string& working_dir,
         bool inherit_output,
         bool filter_health_logs,
-        const std::vector<std::pair<std::string, std::string>>& env_vars,
-        std::shared_ptr<ProcessOutputCapture> output_capture) override {
+        const std::vector<std::pair<std::string, std::string>>& env_vars) override {
 
         ProcessHandle handle;
         handle.handle = nullptr;
         handle.pid = 0;
-        handle.output_capture = output_capture;
 
         std::string cmdline = escape_windows_arg(executable);
         for (const auto& arg : args) {
@@ -407,8 +203,7 @@ public:
         HANDLE stderr_write = nullptr;
         HANDLE nul_input = nullptr;
 
-        bool use_filtered_output =
-            (inherit_output && filter_health_logs) || output_capture != nullptr;
+        bool use_filtered_output = (inherit_output && filter_health_logs);
 
         if (inherit_output && !filter_health_logs) {
             const HANDLE std_in = GetStdHandle(STD_INPUT_HANDLE);
@@ -422,32 +217,39 @@ public:
 
             if (invalid_stdio) {
                 use_filtered_output = true;
-                if (!output_capture) {
-                    output_capture =
-                        std::make_shared<ProcessOutputCapture>(0);
-                    handle.output_capture = output_capture;
-                }
                 LOG(WARNING, "ProcessManager")
                     << "Parent std handles are unavailable; enabling filtered output capture"
                     << std::endl;
             }
         }
 
-        if (use_filtered_output) {
-            if (!CreatePipe(&stdout_read, &stdout_write, nullptr, 0)) {
+        // If inherit_output is true, either use pipes with filtering or direct inheritance
+        if (inherit_output && use_filtered_output) {
+            // Create pipes for stdout and stderr to filter output
+            SECURITY_ATTRIBUTES sa;
+            sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+            sa.bInheritHandle = TRUE;
+            sa.lpSecurityDescriptor = nullptr;
+
+            if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0)) {
                 throw std::runtime_error("Failed to create stdout pipe");
             }
-            if (!CreatePipe(&stderr_read, &stderr_write, nullptr, 0)) {
+            if (!CreatePipe(&stderr_read, &stderr_write, &sa, 0)) {
                 CloseHandle(stdout_read);
                 CloseHandle(stdout_write);
                 throw std::runtime_error("Failed to create stderr pipe");
             }
+
+            // Make sure the read handles are not inherited
+            SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
+            SetHandleInformation(stderr_read, HANDLE_FLAG_INHERIT, 0);
 
             si.dwFlags = STARTF_USESTDHANDLES;
             si.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
             if (si.hStdInput == nullptr || si.hStdInput == INVALID_HANDLE_VALUE) {
                 nul_input = CreateFileA("NUL", GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
                 if (nul_input != INVALID_HANDLE_VALUE) {
+                    SetHandleInformation(nul_input, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
                     si.hStdInput = nul_input;
                 } else {
                     si.hStdInput = nullptr;
@@ -456,9 +258,7 @@ public:
             si.hStdOutput = stdout_write;
             si.hStdError = stderr_write;
 
-            if (inherit_output) {
-                LOG(DEBUG, "ProcessManager") << "Starting process with filtered output: " << cmdline << std::endl;
-            }
+            LOG(DEBUG, "ProcessManager") << "Starting process with filtered output: " << cmdline << std::endl;
         } else if (inherit_output) {
             // Direct inheritance without filtering
             si.dwFlags |= STARTF_USESTDHANDLES;
@@ -473,6 +273,8 @@ public:
 
             HANDLE hNul = CreateFileA("NUL", GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (hNul != INVALID_HANDLE_VALUE) {
+                // Ensure the NUL handle is inheritable
+                SetHandleInformation(hNul, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
                 si.hStdOutput = hNul;
                 si.hStdError = hNul;
             }
@@ -483,18 +285,21 @@ public:
             environment_block = build_windows_environment_block(env_vars);
         }
 
-        BOOL success = create_process_with_restricted_handles(
+        BOOL success = CreateProcessA(
+            nullptr,
             const_cast<char*>(cmdline.c_str()),
+            nullptr,
+            nullptr,
+            TRUE,  // Inherit handles
             (inherit_output && !use_filtered_output) ? 0 : CREATE_NO_WINDOW,
             environment_block.empty() ? nullptr : environment_block.data(),
             working_dir.empty() ? nullptr : working_dir.c_str(),
-            si,
+            &si,
             &pi
         );
 
         // If we opened a NUL handle, we can close it now (the child process has its own inherited handle)
-        if (!inherit_output && !use_filtered_output &&
-            si.hStdOutput != nullptr && si.hStdOutput != INVALID_HANDLE_VALUE) {
+        if (!inherit_output && si.hStdOutput != nullptr && si.hStdOutput != INVALID_HANDLE_VALUE) {
             CloseHandle(si.hStdOutput);
         }
 
@@ -531,9 +336,10 @@ public:
         if (stdout_write) CloseHandle(stdout_write);
         if (stderr_write) CloseHandle(stderr_write);
 
-        if (use_filtered_output) {
-            start_output_reader(stdout_read, inherit_output, output_capture);
-            start_output_reader(stderr_read, inherit_output, output_capture);
+        // Start filter threads if needed
+        if (inherit_output && use_filtered_output) {
+            CreateThread(nullptr, 0, output_filter_thread, stdout_read, 0, nullptr);
+            CreateThread(nullptr, 0, output_filter_thread, stderr_read, 0, nullptr);
         }
 
         if (inherit_output) {
@@ -660,9 +466,17 @@ public:
         HANDLE stdout_read = nullptr;
         HANDLE stdout_write = nullptr;
 
-        if (!CreatePipe(&stdout_read, &stdout_write, nullptr, 0)) {
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.bInheritHandle = TRUE;
+        sa.lpSecurityDescriptor = nullptr;
+
+        if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0)) {
             throw std::runtime_error("Failed to create stdout pipe");
         }
+
+        // Make sure the read handle is not inherited
+        SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
 
         STARTUPINFOA si;
         PROCESS_INFORMATION pi;
@@ -674,12 +488,16 @@ public:
         si.hStdError = capture_stderr ? stdout_write : GetStdHandle(STD_ERROR_HANDLE);
         ZeroMemory(&pi, sizeof(pi));
 
-        BOOL success = create_process_with_restricted_handles(
+        BOOL success = CreateProcessA(
+            nullptr,
             const_cast<char*>(cmdline.c_str()),
+            nullptr,
+            nullptr,
+            TRUE,  // Inherit handles
             CREATE_NO_WINDOW,
             nullptr,
             working_dir.empty() ? nullptr : working_dir.c_str(),
-            si,
+            &si,
             &pi
         );
 
@@ -847,9 +665,15 @@ public:
         HANDLE stdout_read = nullptr;
         HANDLE stdout_write = nullptr;
 
-        if (!CreatePipe(&stdout_read, &stdout_write, nullptr, 0)) {
+        SECURITY_ATTRIBUTES sa;
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.bInheritHandle = TRUE;
+        sa.lpSecurityDescriptor = nullptr;
+
+        if (!CreatePipe(&stdout_read, &stdout_write, &sa, 0)) {
             return -1;
         }
+        SetHandleInformation(stdout_read, HANDLE_FLAG_INHERIT, 0);
 
         STARTUPINFOA si = {};
         si.cb = sizeof(si);
@@ -861,9 +685,10 @@ public:
         PROCESS_INFORMATION pi = {};
         // Wrap in cmd /c so shell features (redirection, pipes) work
         std::string cmdline = "cmd /c " + command;
-        BOOL success = create_process_with_restricted_handles(
-            const_cast<char*>(cmdline.c_str()), CREATE_NO_WINDOW,
-            nullptr, nullptr, si, &pi);
+        BOOL success = CreateProcessA(
+            nullptr, const_cast<char*>(cmdline.c_str()),
+            nullptr, nullptr, TRUE, CREATE_NO_WINDOW,
+            nullptr, nullptr, &si, &pi);
 
         CloseHandle(stdout_write);
 

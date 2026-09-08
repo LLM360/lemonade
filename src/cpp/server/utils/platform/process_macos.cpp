@@ -20,12 +20,6 @@
 #include <cctype>
 
 extern char** environ;
-#ifdef LEMONADE_PROCESS_TEST_HOOK
-extern "C" void lemonade_test_run_with_output_pipe_created();
-extern "C" void lemonade_test_run_command_exit_observed(pid_t pid);
-extern "C" void lemonade_test_run_command_group_cleanup_complete(pid_t pid);
-extern "C" void lemonade_test_run_command_final_reap_complete(pid_t pid);
-#endif
 
 namespace lemon::utils {
 
@@ -56,308 +50,6 @@ static void log_process_line(const std::string& line) {
     }
 }
 
-static void close_pipe(int pipe_fds[2]) {
-    for (int i = 0; i < 2; ++i) {
-        if (pipe_fds[i] >= 0) {
-            close(pipe_fds[i]);
-            pipe_fds[i] = -1;
-        }
-    }
-}
-
-static bool set_close_on_exec(int fd) {
-    int flags;
-    do {
-        flags = fcntl(fd, F_GETFD);
-    } while (flags < 0 && errno == EINTR);
-    if (flags < 0) {
-        return false;
-    }
-
-    int result;
-    do {
-        result = fcntl(fd, F_SETFD, flags | FD_CLOEXEC);
-    } while (result < 0 && errno == EINTR);
-    return result == 0;
-}
-
-static bool create_pipe_above_standard_streams(int pipe_fds[2]) {
-    if (pipe(pipe_fds) < 0) {
-        return false;
-    }
-#ifdef LEMONADE_PROCESS_TEST_HOOK
-    lemonade_test_run_with_output_pipe_created();
-#endif
-
-    for (int i = 0; i < 2; ++i) {
-        if (pipe_fds[i] > STDERR_FILENO) {
-            if (!set_close_on_exec(pipe_fds[i])) {
-                close_pipe(pipe_fds);
-                return false;
-            }
-            continue;
-        }
-
-        int replacement;
-        do {
-            replacement =
-                fcntl(pipe_fds[i], F_DUPFD_CLOEXEC, STDERR_FILENO + 1);
-        } while (replacement < 0 && errno == EINTR);
-        if (replacement < 0) {
-            close_pipe(pipe_fds);
-            return false;
-        }
-        close(pipe_fds[i]);
-        pipe_fds[i] = replacement;
-    }
-    return true;
-}
-
-static void kill_process_group(pid_t pid, bool fallback_to_process = true) {
-    int result;
-    do {
-        result = ::kill(-pid, SIGKILL);
-    } while (result < 0 && errno == EINTR);
-    if (fallback_to_process && result < 0 && errno == ESRCH) {
-        do {
-            result = ::kill(pid, SIGKILL);
-        } while (result < 0 && errno == EINTR);
-    }
-}
-
-class SpawnFileActions {
-public:
-    SpawnFileActions() {
-        error_ = posix_spawn_file_actions_init(&actions_);
-        initialized_ = error_ == 0;
-    }
-
-    ~SpawnFileActions() {
-        if (initialized_) {
-            posix_spawn_file_actions_destroy(&actions_);
-        }
-    }
-
-    SpawnFileActions(const SpawnFileActions&) = delete;
-    SpawnFileActions& operator=(const SpawnFileActions&) = delete;
-
-    void add_close(int fd) {
-        if (error_ == 0) {
-            error_ = posix_spawn_file_actions_addclose(&actions_, fd);
-        }
-    }
-
-    void add_dup2(int source, int destination) {
-        if (error_ == 0) {
-            error_ =
-                posix_spawn_file_actions_adddup2(&actions_, source, destination);
-        }
-    }
-
-    void add_open(int fd, const char* path, int flags, mode_t mode) {
-        if (error_ == 0) {
-            error_ = posix_spawn_file_actions_addopen(&actions_, fd, path,
-                                                      flags, mode);
-        }
-    }
-
-    void add_inherit_if_open(int fd) {
-        if (error_ != 0) {
-            return;
-        }
-
-        int flags;
-        do {
-            flags = fcntl(fd, F_GETFD);
-        } while (flags < 0 && errno == EINTR);
-        if (flags < 0) {
-            if (errno != EBADF) {
-                error_ = errno;
-            }
-            return;
-        }
-        if ((flags & FD_CLOEXEC) == 0) {
-            error_ = posix_spawn_file_actions_addinherit_np(&actions_, fd);
-        }
-    }
-
-    void add_chdir(const std::string& working_dir) {
-        if (error_ != 0 || working_dir.empty()) {
-            return;
-        }
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-        error_ = posix_spawn_file_actions_addchdir_np(&actions_,
-                                                      working_dir.c_str());
-#pragma clang diagnostic pop
-    }
-
-    int error() const { return error_; }
-    posix_spawn_file_actions_t* get() { return &actions_; }
-
-private:
-    posix_spawn_file_actions_t actions_;
-    bool initialized_ = false;
-    int error_ = 0;
-};
-
-class SpawnAttributes {
-public:
-    SpawnAttributes() {
-        error_ = posix_spawnattr_init(&attributes_);
-        initialized_ = error_ == 0;
-    }
-
-    ~SpawnAttributes() {
-        if (initialized_) {
-            posix_spawnattr_destroy(&attributes_);
-        }
-    }
-
-    SpawnAttributes(const SpawnAttributes&) = delete;
-    SpawnAttributes& operator=(const SpawnAttributes&) = delete;
-
-    void set_default_signals() {
-        if (error_ != 0) {
-            return;
-        }
-
-        sigset_t default_signals;
-        if (sigfillset(&default_signals) != 0) {
-            error_ = errno;
-            return;
-        }
-        error_ = posix_spawnattr_setsigdefault(&attributes_, &default_signals);
-    }
-
-    void set_process_group(pid_t process_group) {
-        if (error_ == 0) {
-            error_ = posix_spawnattr_setpgroup(&attributes_, process_group);
-        }
-    }
-
-    void set_flags(short flags) {
-        if (error_ == 0) {
-            error_ = posix_spawnattr_setflags(&attributes_, flags);
-        }
-    }
-
-    int error() const { return error_; }
-    posix_spawnattr_t* get() { return &attributes_; }
-
-private:
-    posix_spawnattr_t attributes_;
-    bool initialized_ = false;
-    int error_ = 0;
-};
-
-static pid_t spawn_capturing_output(const std::string& executable,
-                                    const std::vector<std::string>& args,
-                                    const std::string& working_dir,
-                                    bool capture_stderr,
-                                    bool create_process_group,
-                                    int output_pipe[2]) {
-    SpawnFileActions file_actions;
-    file_actions.add_inherit_if_open(STDIN_FILENO);
-    file_actions.add_close(output_pipe[0]);
-    file_actions.add_dup2(output_pipe[1], STDOUT_FILENO);
-    if (capture_stderr) {
-        file_actions.add_dup2(output_pipe[1], STDERR_FILENO);
-    } else {
-        file_actions.add_inherit_if_open(STDERR_FILENO);
-    }
-    file_actions.add_close(output_pipe[1]);
-    file_actions.add_chdir(working_dir);
-
-    SpawnAttributes attributes;
-    short spawn_flags = POSIX_SPAWN_CLOEXEC_DEFAULT;
-    if (create_process_group) {
-        attributes.set_process_group(0);
-        spawn_flags |= POSIX_SPAWN_SETPGROUP;
-    }
-    attributes.set_flags(spawn_flags);
-
-    std::vector<char*> argv_ptrs;
-    argv_ptrs.reserve(args.size() + 2);
-    argv_ptrs.push_back(const_cast<char*>(executable.c_str()));
-    for (const auto& arg : args) {
-        argv_ptrs.push_back(const_cast<char*>(arg.c_str()));
-    }
-    argv_ptrs.push_back(nullptr);
-
-    int spawn_result = file_actions.error();
-    if (spawn_result == 0) {
-        spawn_result = attributes.error();
-    }
-
-    pid_t pid = 0;
-    if (spawn_result == 0) {
-        spawn_result = posix_spawnp(&pid, executable.c_str(),
-                                    file_actions.get(), attributes.get(),
-                                    argv_ptrs.data(), environ);
-    }
-    if (spawn_result != 0) {
-        close_pipe(output_pipe);
-        throw std::runtime_error(std::string("posix_spawn failed: ") +
-                                 strerror(spawn_result));
-    }
-
-    close(output_pipe[1]);
-    output_pipe[1] = -1;
-    return pid;
-}
-
-static void read_process_output(
-    int fd,
-    bool log_output,
-    const std::shared_ptr<ProcessOutputCapture>& output_capture) {
-    char buffer[4096];
-    std::string line_buffer;
-    ssize_t bytes_read;
-
-    while ((bytes_read = read(fd, buffer, sizeof(buffer))) > 0) {
-        if (output_capture) {
-            output_capture->append(buffer, static_cast<std::size_t>(bytes_read));
-        }
-        if (!log_output) {
-            continue;
-        }
-
-        line_buffer.append(buffer, static_cast<std::size_t>(bytes_read));
-        size_t pos;
-        while ((pos = line_buffer.find('\n')) != std::string::npos) {
-            std::string line = line_buffer.substr(0, pos);
-            line_buffer.erase(0, pos + 1);
-            log_process_line(line);
-        }
-    }
-
-    if (log_output && !line_buffer.empty()) {
-        log_process_line(line_buffer);
-    }
-    close(fd);
-    if (output_capture) {
-        output_capture->finish_reader();
-    }
-}
-
-static void start_process_output_reader(
-    int fd,
-    bool log_output,
-    const std::shared_ptr<ProcessOutputCapture>& output_capture) {
-    try {
-        std::thread(read_process_output, fd, log_output, output_capture).detach();
-    } catch (const std::exception& error) {
-        close(fd);
-        if (output_capture) {
-            output_capture->finish_reader();
-        }
-        LOG(ERROR, "ProcessManager")
-            << "Failed to start process output reader: " << error.what()
-            << std::endl;
-    }
-}
-
 // Forward declare UnixProcessPlatform base class methods
 class MacOSProcessPlatform : public ProcessPlatform {
 public:
@@ -367,8 +59,7 @@ public:
         const std::string& working_dir,
         bool inherit_output,
         bool filter_health_logs,
-        const std::vector<std::pair<std::string, std::string>>& env_vars,
-        std::shared_ptr<ProcessOutputCapture> output_capture) override;
+        const std::vector<std::pair<std::string, std::string>>& env_vars) override;
 
     void terminate(ProcessHandle handle) override;
     bool is_running(ProcessHandle handle) override;
@@ -396,25 +87,17 @@ ProcessHandle MacOSProcessPlatform::spawn(
     const std::string& working_dir,
     bool inherit_output,
     bool filter_health_logs,
-    const std::vector<std::pair<std::string, std::string>>& env_vars,
-    std::shared_ptr<ProcessOutputCapture> output_capture) {
+    const std::vector<std::pair<std::string, std::string>>& env_vars) {
 
     ProcessHandle handle;
     handle.handle = nullptr;
     handle.pid = 0;
-    handle.output_capture = output_capture;
 
     int stdout_pipe[2] = {-1, -1};
     int stderr_pipe[2] = {-1, -1};
-    const bool redirect_output =
-        (inherit_output && filter_health_logs) || output_capture != nullptr;
 
-    if (redirect_output) {
-        if (!create_pipe_above_standard_streams(stdout_pipe)) {
-            throw std::runtime_error("Failed to create pipes for output filtering");
-        }
-        if (!create_pipe_above_standard_streams(stderr_pipe)) {
-            close_pipe(stdout_pipe);
+    if (inherit_output && filter_health_logs) {
+        if (pipe(stdout_pipe) < 0 || pipe(stderr_pipe) < 0) {
             throw std::runtime_error("Failed to create pipes for output filtering");
         }
     }
@@ -445,30 +128,34 @@ ProcessHandle MacOSProcessPlatform::spawn(
     // pipe/working-dir semantics. Adds POSIX_SPAWN_CLOEXEC_DEFAULT to avoid
     // leaking lemond FDs into the child, and POSIX_SPAWN_SETSIGDEF to reset
     // inherited SIG_IGN dispositions.
-    SpawnFileActions file_actions;
-    file_actions.add_inherit_if_open(STDIN_FILENO);
+    posix_spawn_file_actions_t file_actions;
+    posix_spawn_file_actions_init(&file_actions);
 
-    if (redirect_output) {
-        file_actions.add_close(stdout_pipe[0]);
-        file_actions.add_close(stderr_pipe[0]);
-        file_actions.add_dup2(stdout_pipe[1], STDOUT_FILENO);
-        file_actions.add_dup2(stderr_pipe[1], STDERR_FILENO);
-        file_actions.add_close(stdout_pipe[1]);
-        file_actions.add_close(stderr_pipe[1]);
+    if (inherit_output && filter_health_logs) {
+        posix_spawn_file_actions_addclose(&file_actions, stdout_pipe[0]);
+        posix_spawn_file_actions_addclose(&file_actions, stderr_pipe[0]);
+        posix_spawn_file_actions_adddup2(&file_actions, stdout_pipe[1], STDOUT_FILENO);
+        posix_spawn_file_actions_adddup2(&file_actions, stderr_pipe[1], STDERR_FILENO);
+        posix_spawn_file_actions_addclose(&file_actions, stdout_pipe[1]);
+        posix_spawn_file_actions_addclose(&file_actions, stderr_pipe[1]);
     } else if (!inherit_output) {
-        file_actions.add_open(STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
-        file_actions.add_dup2(STDOUT_FILENO, STDERR_FILENO);
-    } else {
-        file_actions.add_inherit_if_open(STDOUT_FILENO);
-        file_actions.add_inherit_if_open(STDERR_FILENO);
+        posix_spawn_file_actions_addopen(&file_actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+        posix_spawn_file_actions_adddup2(&file_actions, STDOUT_FILENO, STDERR_FILENO);
     }
 
-    file_actions.add_chdir(working_dir);
+    if (!working_dir.empty()) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+        posix_spawn_file_actions_addchdir_np(&file_actions, working_dir.c_str());
+#pragma clang diagnostic pop
+    }
 
-    SpawnAttributes attributes;
-    attributes.set_default_signals();
-    attributes.set_flags(POSIX_SPAWN_CLOEXEC_DEFAULT |
-                         POSIX_SPAWN_SETSIGDEF);
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    sigset_t default_signals;
+    sigfillset(&default_signals);
+    posix_spawnattr_setsigdefault(&attr, &default_signals);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_CLOEXEC_DEFAULT | POSIX_SPAWN_SETSIGDEF);
 
     // Build envp
     std::vector<std::string> env_strings;
@@ -503,22 +190,19 @@ ProcessHandle MacOSProcessPlatform::spawn(
     }
     argv_ptrs.push_back(nullptr);
 
-    int spawn_rc = file_actions.error();
-    if (spawn_rc == 0) {
-        spawn_rc = attributes.error();
-    }
-
     pid_t pid = 0;
-    if (spawn_rc == 0) {
-        spawn_rc = posix_spawnp(&pid, executable.c_str(), file_actions.get(),
-                                attributes.get(), argv_ptrs.data(),
-                                envp.data());
-    }
+    int spawn_rc = posix_spawnp(&pid, executable.c_str(), &file_actions, &attr,
+                                argv_ptrs.data(), envp.data());
+
+    posix_spawn_file_actions_destroy(&file_actions);
+    posix_spawnattr_destroy(&attr);
 
     if (spawn_rc != 0) {
-        if (redirect_output) {
-            close_pipe(stdout_pipe);
-            close_pipe(stderr_pipe);
+        if (inherit_output && filter_health_logs) {
+            close(stdout_pipe[0]);
+            close(stdout_pipe[1]);
+            close(stderr_pipe[0]);
+            close(stderr_pipe[1]);
         }
         throw std::runtime_error(std::string("posix_spawn failed: ") + strerror(spawn_rc));
     }
@@ -529,14 +213,58 @@ ProcessHandle MacOSProcessPlatform::spawn(
         LOG(INFO, "ProcessManager") << "Process started successfully, PID: " << pid << std::endl;
     }
 
-    if (redirect_output) {
+    // Start filter threads if needed
+    if (inherit_output && filter_health_logs) {
         close(stdout_pipe[1]);
         close(stderr_pipe[1]);
 
-        start_process_output_reader(stdout_pipe[0], inherit_output,
-                                    output_capture);
-        start_process_output_reader(stderr_pipe[0], inherit_output,
-                                    output_capture);
+        std::thread([fd = stdout_pipe[0]]() {
+            char buffer[4096];
+            std::string line_buffer;
+            ssize_t bytes_read;
+
+            while ((bytes_read = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+                buffer[bytes_read] = '\0';
+                line_buffer += buffer;
+
+                size_t pos;
+                while ((pos = line_buffer.find('\n')) != std::string::npos) {
+                    std::string line = line_buffer.substr(0, pos);
+                    line_buffer = line_buffer.substr(pos + 1);
+                    log_process_line(line);
+                }
+            }
+
+            if (!line_buffer.empty()) {
+                log_process_line(line_buffer);
+            }
+
+            close(fd);
+        }).detach();
+
+        std::thread([fd = stderr_pipe[0]]() {
+            char buffer[4096];
+            std::string line_buffer;
+            ssize_t bytes_read;
+
+            while ((bytes_read = read(fd, buffer, sizeof(buffer) - 1)) > 0) {
+                buffer[bytes_read] = '\0';
+                line_buffer += buffer;
+
+                size_t pos;
+                while ((pos = line_buffer.find('\n')) != std::string::npos) {
+                    std::string line = line_buffer.substr(0, pos);
+                    line_buffer = line_buffer.substr(pos + 1);
+                    log_process_line(line);
+                }
+            }
+
+            if (!line_buffer.empty()) {
+                log_process_line(line_buffer);
+            }
+
+            close(fd);
+        }).detach();
     }
 
     return handle;
@@ -731,13 +459,46 @@ int MacOSProcessPlatform::run_with_output(
     int timeout_seconds,
     bool capture_stderr) {
 
-    int stdout_pipe[2] = {-1, -1};
+    // For simplicity, reuse fork/exec for run_with_output on macOS
+    // (This is a less critical path than spawn)
+    int stdout_pipe[2];
 
-    if (!create_pipe_above_standard_streams(stdout_pipe)) {
+    if (pipe(stdout_pipe) < 0) {
         throw std::runtime_error("Failed to create pipe");
     }
-    const pid_t pid = spawn_capturing_output(
-        executable, args, working_dir, capture_stderr, false, stdout_pipe);
+
+    pid_t pid = fork();
+
+    if (pid < 0) {
+        close(stdout_pipe[0]);
+        close(stdout_pipe[1]);
+        throw std::runtime_error("Failed to fork process");
+    }
+
+    if (pid == 0) {
+        close(stdout_pipe[0]);
+        dup2(stdout_pipe[1], STDOUT_FILENO);
+        if (capture_stderr) {
+            dup2(stdout_pipe[1], STDERR_FILENO);
+        }
+        close(stdout_pipe[1]);
+
+        if (!working_dir.empty()) {
+            chdir(working_dir.c_str());
+        }
+
+        std::vector<char*> argv_ptrs;
+        argv_ptrs.push_back(const_cast<char*>(executable.c_str()));
+        for (const auto& arg : args) {
+            argv_ptrs.push_back(const_cast<char*>(arg.c_str()));
+        }
+        argv_ptrs.push_back(nullptr);
+
+        execvp(executable.c_str(), argv_ptrs.data());
+        _exit(127);
+    }
+
+    close(stdout_pipe[1]);
 
     std::string line_buffer;
     char buffer[4096];
@@ -867,132 +628,18 @@ int MacOSProcessPlatform::find_free_port(int start_port) {
 
 int MacOSProcessPlatform::run_command(const std::string& command, std::string& output, int timeout_seconds) {
     output.clear();
-    int output_pipe[2] = {-1, -1};
-    if (!create_pipe_above_standard_streams(output_pipe)) {
+
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
         return -1;
     }
 
-    pid_t pid;
-    try {
-        pid = spawn_capturing_output("/bin/sh", {"-c", command}, "", false,
-                                     true, output_pipe);
-    } catch (...) {
-        return -1;
+    char buf[4096];
+    while (fgets(buf, sizeof(buf), pipe)) {
+        output += buf;
     }
 
-    const int flags = fcntl(output_pipe[0], F_GETFL, 0);
-    if (flags < 0 ||
-        fcntl(output_pipe[0], F_SETFL, flags | O_NONBLOCK) != 0) {
-        kill_process_group(pid);
-        close(output_pipe[0]);
-        int status = 0;
-        while (waitpid(pid, &status, 0) < 0 && errno == EINTR) {
-        }
-        return -1;
-    }
-
-    const auto start_time = std::chrono::steady_clock::now();
-    const auto deadline =
-        start_time + std::chrono::seconds(timeout_seconds > 0
-                                              ? timeout_seconds
-                                              : 0);
-    bool timed_out = false;
-    bool read_failed = false;
-    char buffer[4096];
-    while (true) {
-        if (timeout_seconds > 0) {
-            if (std::chrono::steady_clock::now() >= deadline) {
-                kill_process_group(pid);
-                timed_out = true;
-                break;
-            }
-        }
-
-        const ssize_t bytes_read = read(output_pipe[0], buffer, sizeof(buffer));
-        if (bytes_read > 0) {
-            output.append(buffer, static_cast<std::size_t>(bytes_read));
-            continue;
-        }
-        if (bytes_read == 0) {
-            break;
-        }
-        if (errno == EINTR) {
-            continue;
-        }
-        if (errno != EAGAIN && errno != EWOULDBLOCK) {
-            kill_process_group(pid);
-            read_failed = true;
-            break;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-
-    close(output_pipe[0]);
-    int status = 0;
-    pid_t wait_result = -1;
-    bool child_identity_lost = false;
-    if (!timed_out && !read_failed) {
-        while (true) {
-            siginfo_t child_info{};
-            int wait_options = WEXITED | WNOWAIT;
-            if (timeout_seconds > 0) {
-                wait_options |= WNOHANG;
-            }
-
-            int observe_result;
-            do {
-                observe_result =
-                    waitid(P_PID, static_cast<id_t>(pid), &child_info,
-                           wait_options);
-            } while (observe_result < 0 && errno == EINTR);
-
-            if (observe_result == 0 && child_info.si_pid == pid) {
-                break;
-            }
-            if (observe_result < 0) {
-                child_identity_lost = errno == ECHILD;
-                if (!child_identity_lost) {
-                    kill_process_group(pid);
-                }
-                read_failed = true;
-                break;
-            }
-            if (timeout_seconds > 0 &&
-                std::chrono::steady_clock::now() >= deadline) {
-                kill_process_group(pid);
-                timed_out = true;
-                break;
-            }
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        }
-    }
-    if (timed_out || read_failed) {
-        if (child_identity_lost) {
-            return -1;
-        }
-        do {
-            wait_result = waitpid(pid, &status, 0);
-        } while (wait_result < 0 && errno == EINTR);
-        return -1;
-    }
-
-#ifdef LEMONADE_PROCESS_TEST_HOOK
-    lemonade_test_run_command_exit_observed(pid);
-#endif
-    kill_process_group(pid, false);
-#ifdef LEMONADE_PROCESS_TEST_HOOK
-    lemonade_test_run_command_group_cleanup_complete(pid);
-#endif
-    do {
-        wait_result = waitpid(pid, &status, 0);
-    } while (wait_result < 0 && errno == EINTR);
-    if (wait_result != pid) {
-        return -1;
-    }
-#ifdef LEMONADE_PROCESS_TEST_HOOK
-    lemonade_test_run_command_final_reap_complete(pid);
-#endif
-    return status;
+    return pclose(pipe);
 }
 
 std::unique_ptr<ProcessPlatform> create_process_platform() {

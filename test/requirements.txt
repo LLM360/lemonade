@@ -28,6 +28,3 @@ ollama
 
 # JSON Schema validator (required for routing policy / decision fixture tests)
 jsonschema
-
-# YAML parser (required for workflow supply-chain tests)
-pyyaml

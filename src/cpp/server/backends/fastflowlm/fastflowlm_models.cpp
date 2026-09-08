@@ -160,7 +160,17 @@ std::vector<std::string> flm_installed_checkpoints() {
     int rc = lemon::utils::ProcessManager::run_command(command, output);
 #else
     std::string command = "\"" + flm_path + "\" list --filter installed --quiet --json 2>/dev/null";
-    (void)lemon::utils::ProcessManager::run_command(command, output);
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        return installed_models;
+    }
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+
+    pclose(pipe);
 #endif
 
     // Parse output: { "models": [ { "name": "modelname:tag", ... }, ... ] }
@@ -230,7 +240,17 @@ std::vector<ModelInfo> flm_discover_models() {
     }
 #else
     std::string command = "\"" + flm_path + "\" list --json 2>/dev/null";
-    (void)lemon::utils::ProcessManager::run_command(command, output);
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        return flm_models;
+    }
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+
+    pclose(pipe);
 #endif
 
     // Parse output: { "models": [ { "name": "modelname:tag", "footprint": 1.23, ... }, ... ] }
@@ -545,7 +565,17 @@ std::string flm_version() {
     int rc = lemon::utils::ProcessManager::run_command(command, output);
     #else
     std::string command = "\"" + flm_path + "\" version --json 2>/dev/null";
-    (void)lemon::utils::ProcessManager::run_command(command, output);
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        return "unknown";
+    }
+
+    char buffer[256];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+
+    pclose(pipe);
     #endif
 
     // Parse JSON output: { "version": "0.9.34" }
@@ -650,7 +680,18 @@ bool run_flm_validate(const std::string& flm_path, std::string& error_message) {
 #ifdef _WIN32
     exit_code = lemon::utils::ProcessManager::run_command(command, output);
 #else
-    exit_code = lemon::utils::ProcessManager::run_command(command, output);
+    FILE* pipe = popen(command.c_str(), "r");
+    if (!pipe) {
+        error_message = "Failed to execute " + flm_exe;
+        return false;
+    }
+
+    char buffer[1024];
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        output += buffer;
+    }
+
+    exit_code = pclose(pipe);
     if (exit_code != -1) {
         exit_code = WEXITSTATUS(exit_code);
     }

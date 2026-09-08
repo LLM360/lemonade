@@ -159,7 +159,7 @@ For example, to use your own Vulkan `llama-server` in place of Lemonade's:
     lemond.exe ./
 
     REM Set the llama-server vulkan binary path
-    lemonade.exe config set llamacpp.vulkan_bin=C:\path\to\llama-server.exe
+    lemonade.exe config set "llamacpp.vulkan_bin=C:\path\to\llama-server.exe"
     ```
 
 === "Linux (bash)"
@@ -173,3 +173,63 @@ For example, to use your own Vulkan `llama-server` in place of Lemonade's:
     ```
 
 See the `*_bin` settings in the [Configuration Guide](../guide/configuration/README.md) for the full set of customization options.
+
+### IFM K2-Horizon with a custom llama.cpp build
+
+K2-Horizon can use the existing `llamacpp` recipe with a build of IFM's
+[`model/K2Horizon` branch](https://github.com/MBZUAI-IFM/llama.cpp/tree/model/K2Horizon).
+No Lemonade source changes or managed-backend version updates are required.
+
+Build `llama-server` using the branch's [build instructions](https://github.com/MBZUAI-IFM/llama.cpp/blob/model/K2Horizon/docs/build.md)
+for your accelerator. For example, on macOS with Metal:
+
+```bash
+git clone --branch model/K2Horizon --single-branch https://github.com/MBZUAI-IFM/llama.cpp.git llama.cpp-ifm
+cmake -S llama.cpp-ifm -B llama.cpp-ifm/build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE=Release
+cmake --build llama.cpp-ifm/build --config Release --target llama-server -j
+```
+
+With `lemond` running, select the matching backend and the **full executable path**
+(not its directory). Keep the build's shared libraries alongside the executable.
+
+```bash
+lemonade config set llamacpp.backend=metal "llamacpp.metal_bin=$(pwd)/llama.cpp-ifm/build/bin/llama-server"
+```
+
+For a Vulkan build on Windows or Linux, use `llamacpp.backend=vulkan` and
+`llamacpp.vulkan_bin` instead; Windows builds normally place `llama-server.exe`
+under `build/bin/Release`. The override applies to all models using that backend.
+Unload any already-loaded model before switching binaries.
+
+Register and download a model through the existing [custom-model CLI](../guide/configuration/custom-models.md):
+
+```bash
+lemonade pull user.K2-Horizon-0.9B --recipe llamacpp --checkpoint main IFM/K2-Horizon-0.9B-GGUF:K2-Horizon-1B-BF16.gguf
+```
+
+For the larger models, substitute the corresponding name and checkpoint:
+
+| Name | Checkpoint | BF16 weight size |
+|---|---|---:|
+| `user.K2-Horizon-0.9B` | `IFM/K2-Horizon-0.9B-GGUF:K2-Horizon-1B-BF16.gguf` | 2.16 GB |
+| `user.K2-Horizon-3.7B` | `IFM/K2-Horizon-3.7B-GGUF:K2-Horizon-4B-BF16.gguf` | 10.13 GB |
+| `user.K2-Horizon-7B` | `IFM/K2-Horizon-7B-GGUF:K2-Horizon-7B-BF16.gguf` | 18.01 GB |
+
+Context and compute buffers require additional memory. Start with a bounded context:
+
+```bash
+curl http://localhost:8000/v1/load -H "Content-Type: application/json" \
+  -d '{"model_name":"user.K2-Horizon-0.9B","ctx_size":4096}'
+curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+  -d '{"model":"user.K2-Horizon-0.9B","messages":[{"role":"user","content":"What is 2 + 2?"}],"reasoning_effort":"high","max_tokens":1024}'
+```
+
+These are custom models, not a claim of support in Lemonade's managed binaries.
+IFM commit `35999d101cf2233fc54f09c3c8d599da7303ce02` was used for development
+validation; its medium/low reasoning modes can leak control markers. Prefer high
+reasoning and the default XML tool format, and verify any other modes against your
+build. K2-Horizon Uno is not covered by this example.
+
+To return to Lemonade's managed Metal binary, unload the model and run
+`lemonade config set llamacpp.metal_bin=builtin` (use the corresponding `*_bin`
+key for another backend).
