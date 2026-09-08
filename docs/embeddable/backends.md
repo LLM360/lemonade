@@ -225,10 +225,6 @@ curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/jso
 ```
 
 These are custom models, not a claim of support in Lemonade's managed binaries.
-IFM commit `35999d101cf2233fc54f09c3c8d599da7303ce02` was used for development
-validation; its medium/low reasoning modes can leak control markers. Prefer high
-reasoning and the default XML tool format, and verify any other modes against your
-build. K2-Horizon Uno is not covered by this example.
 
 To return to Lemonade's managed Metal binary, unload the model and run
 `lemonade config set llamacpp.metal_bin=builtin` (use the corresponding `*_bin`
