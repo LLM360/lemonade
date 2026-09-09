@@ -180,7 +180,35 @@ K2-Horizon can use the existing `llamacpp` recipe with a build of IFM's
 [`model/K2Horizon` branch](https://github.com/MBZUAI-IFM/llama.cpp/tree/model/K2Horizon).
 No Lemonade source changes or managed-backend version updates are required.
 
-Build `llama-server` using the branch's [build instructions](https://github.com/MBZUAI-IFM/llama.cpp/blob/model/K2Horizon/docs/build.md)
+The following is a complete macOS source-build example. From the Lemonade
+source tree, check the dependencies and build the server and CLI:
+
+```bash
+./setup.sh
+cmake --preset default -DBUILD_WEB_APP=OFF -DBUILD_TESTING=OFF
+cmake --build --preset default --target lemond lemonade -j
+```
+
+If `setup.sh` reaches the pre-commit installation step and exits because the
+repository has `core.hooksPath` configured, that does not prevent the runtime
+build after all dependency checks have passed; continue with the CMake commands.
+This minimal build intentionally omits the desktop and web apps. The message
+"This build of Lemonade has been built without a desktop app or a web app" at
+the server root is expected and does not affect the REST API.
+
+To include the browser UI instead, configure with `BUILD_WEB_APP=ON`, build the
+`web-app` target, and restart `lemond`:
+
+```bash
+cmake --preset default -DBUILD_WEB_APP=ON -DBUILD_TESTING=OFF
+cmake --build --preset default --target lemond lemonade web-app -j
+```
+
+The UI is then available at the server root. A native desktop app has additional
+prerequisites; see the [application development guide](../dev/app.md).
+
+Build `llama-server` from the Lemonade source tree using the branch's
+[build instructions](https://github.com/MBZUAI-IFM/llama.cpp/blob/model/K2Horizon/docs/build.md)
 for your accelerator. For example, on macOS with Metal:
 
 ```bash
@@ -189,11 +217,21 @@ cmake -S llama.cpp-ifm -B llama.cpp-ifm/build -DGGML_METAL=ON -DCMAKE_BUILD_TYPE
 cmake --build llama.cpp-ifm/build --config Release --target llama-server -j
 ```
 
-With `lemond` running, select the matching backend and the **full executable path**
-(not its directory). Keep the build's shared libraries alongside the executable.
+Start Lemonade on an explicit port in one terminal:
 
 ```bash
-lemonade config set llamacpp.backend=metal "llamacpp.metal_bin=$(pwd)/llama.cpp-ifm/build/bin/llama-server"
+./build/lemond --port 13305
+```
+
+In a second terminal, select the matching backend and the **full executable
+path** (not its directory). Keep the build's shared libraries alongside the
+executable. Supplying `--port` makes the source-built CLI use the same server
+without relying on discovery.
+
+```bash
+./build/lemonade --port 13305 config set \
+  llamacpp.backend=metal \
+  "llamacpp.metal_bin=$(pwd)/llama.cpp-ifm/build/bin/llama-server"
 ```
 
 For a Vulkan build on Windows or Linux, use `llamacpp.backend=vulkan` and
@@ -204,7 +242,9 @@ Unload any already-loaded model before switching binaries.
 Register and download a model through the existing [custom-model CLI](../guide/configuration/custom-models.md):
 
 ```bash
-lemonade pull user.K2-Horizon-0.9B --recipe llamacpp --checkpoint main IFM/K2-Horizon-0.9B-GGUF:K2-Horizon-1B-BF16.gguf
+./build/lemonade --port 13305 pull user.K2-Horizon-0.9B \
+  --recipe llamacpp \
+  --checkpoint main IFM/K2-Horizon-0.9B-GGUF:K2-Horizon-1B-BF16.gguf
 ```
 
 For the larger models, substitute the corresponding name and checkpoint:
@@ -218,14 +258,14 @@ For the larger models, substitute the corresponding name and checkpoint:
 Context and compute buffers require additional memory. Start with a bounded context:
 
 ```bash
-curl http://localhost:8000/v1/load -H "Content-Type: application/json" \
+curl http://localhost:13305/v1/load -H "Content-Type: application/json" \
   -d '{"model_name":"user.K2-Horizon-0.9B","ctx_size":4096}'
-curl http://localhost:8000/v1/chat/completions -H "Content-Type: application/json" \
+curl http://localhost:13305/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"model":"user.K2-Horizon-0.9B","messages":[{"role":"user","content":"What is 2 + 2?"}],"reasoning_effort":"high","max_tokens":1024}'
 ```
 
 These are custom models, not a claim of support in Lemonade's managed binaries.
 
 To return to Lemonade's managed Metal binary, unload the model and run
-`lemonade config set llamacpp.metal_bin=builtin` (use the corresponding `*_bin`
-key for another backend).
+`./build/lemonade --port 13305 config set llamacpp.metal_bin=builtin` (use the
+corresponding `*_bin` key for another backend).
