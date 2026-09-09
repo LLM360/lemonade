@@ -264,27 +264,36 @@ through the existing [custom-model CLI](../guide/configuration/custom-models.md)
   --checkpoint main IFM/K2-Horizon-MoVA-36B-A4B-GGUF:K2-Horizon-36B-BF16.gguf
 ```
 
-These BF16 weights require approximately 175 GB of disk space in total:
+These BF16 weights require approximately 175 GB of disk space in total. The
+maximum context windows come from the corresponding model cards and are also
+stored in the GGUF metadata:
 
-| Name | BF16 weight size |
-|---|---:|
-| `user.K2-Horizon-0.9B` | 2.16 GB |
-| `user.K2-Horizon-3.7B` | 10.13 GB |
-| `user.K2-Horizon-7B` | 18.01 GB |
-| `user.K2-Horizon-32B` | 69.57 GB |
-| `user.K2-Horizon-MoVA-36B-A4B` | 74.92 GB |
+| Name | BF16 weight size | Maximum context |
+|---|---:|---:|
+| `user.K2-Horizon-0.9B` | 2.16 GB | 131,072 tokens (128K) |
+| `user.K2-Horizon-3.7B` | 10.13 GB | 524,288 tokens (512K) |
+| `user.K2-Horizon-7B` | 18.01 GB | 524,288 tokens (512K) |
+| `user.K2-Horizon-32B` | 69.57 GB | 524,288 tokens (512K) |
+| `user.K2-Horizon-MoVA-36B-A4B` | 74.92 GB | 524,288 tokens (512K) |
 
 The 375B model is intentionally not implemented in the IFM llama.cpp branch
 and cannot be used through this integration.
 
-Context and compute buffers require additional memory. Start with a bounded context:
+The custom-model registration does not need a separate context-length option.
+Use `ctx_size` when loading to select the runtime context window. For example,
+load the 0.9B model at its full model-card limit:
 
 ```bash
 curl http://localhost:13305/v1/load -H "Content-Type: application/json" \
-  -d '{"model_name":"user.K2-Horizon-0.9B","ctx_size":4096}'
+  -d '{"model_name":"user.K2-Horizon-0.9B","ctx_size":131072}'
 curl http://localhost:13305/v1/chat/completions -H "Content-Type: application/json" \
   -d '{"model":"user.K2-Horizon-0.9B","messages":[{"role":"user","content":"What is 2 + 2?"}],"reasoning_effort":"high","max_tokens":1024}'
 ```
+
+For any other model in the table, use its model name and `"ctx_size":524288`.
+These are model-supported maxima, not hardware recommendations. KV cache and
+compute buffers require substantial additional memory; choose a smaller
+`ctx_size` if the full window does not fit on the target system.
 
 These are custom models, not a claim of support in Lemonade's managed binaries.
 
