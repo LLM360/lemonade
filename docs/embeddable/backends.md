@@ -245,22 +245,27 @@ through the existing [custom-model CLI](../guide/configuration/custom-models.md)
 ```bash
 ./build/lemonade --port 13305 pull user.K2-Horizon-0.9B \
   --recipe llamacpp \
+  --source huggingface \
   --checkpoint main IFM/K2-Horizon-0.9B-GGUF:K2-Horizon-1B-BF16.gguf
 
 ./build/lemonade --port 13305 pull user.K2-Horizon-3.7B \
   --recipe llamacpp \
+  --source huggingface \
   --checkpoint main IFM/K2-Horizon-3.7B-GGUF:K2-Horizon-4B-BF16.gguf
 
 ./build/lemonade --port 13305 pull user.K2-Horizon-7B \
   --recipe llamacpp \
+  --source huggingface \
   --checkpoint main IFM/K2-Horizon-7B-GGUF:K2-Horizon-7B-BF16.gguf
 
 ./build/lemonade --port 13305 pull user.K2-Horizon-32B \
   --recipe llamacpp \
+  --source huggingface \
   --checkpoint main IFM/K2-Horizon-32B-GGUF:K2-Horizon-32B-BF16.gguf
 
 ./build/lemonade --port 13305 pull user.K2-Horizon-MoVA-36B-A4B \
   --recipe llamacpp \
+  --source huggingface \
   --checkpoint main IFM/K2-Horizon-MoVA-36B-A4B-GGUF:K2-Horizon-36B-BF16.gguf
 ```
 
