@@ -239,21 +239,43 @@ For a Vulkan build on Windows or Linux, use `llamacpp.backend=vulkan` and
 under `build/bin/Release`. The override applies to all models using that backend.
 Unload any already-loaded model before switching binaries.
 
-Register and download a model through the existing [custom-model CLI](../guide/configuration/custom-models.md):
+Register and download all non-Uno models supported by the IFM llama.cpp branch
+through the existing [custom-model CLI](../guide/configuration/custom-models.md):
 
 ```bash
 ./build/lemonade --port 13305 pull user.K2-Horizon-0.9B \
   --recipe llamacpp \
   --checkpoint main IFM/K2-Horizon-0.9B-GGUF:K2-Horizon-1B-BF16.gguf
+
+./build/lemonade --port 13305 pull user.K2-Horizon-3.7B \
+  --recipe llamacpp \
+  --checkpoint main IFM/K2-Horizon-3.7B-GGUF:K2-Horizon-4B-BF16.gguf
+
+./build/lemonade --port 13305 pull user.K2-Horizon-7B \
+  --recipe llamacpp \
+  --checkpoint main IFM/K2-Horizon-7B-GGUF:K2-Horizon-7B-BF16.gguf
+
+./build/lemonade --port 13305 pull user.K2-Horizon-32B \
+  --recipe llamacpp \
+  --checkpoint main IFM/K2-Horizon-32B-GGUF:K2-Horizon-32B-BF16.gguf
+
+./build/lemonade --port 13305 pull user.K2-Horizon-MoVA-36B-A4B \
+  --recipe llamacpp \
+  --checkpoint main IFM/K2-Horizon-MoVA-36B-A4B-GGUF:K2-Horizon-36B-BF16.gguf
 ```
 
-For the larger models, substitute the corresponding name and checkpoint:
+These BF16 weights require approximately 175 GB of disk space in total:
 
-| Name | Checkpoint | BF16 weight size |
-|---|---|---:|
-| `user.K2-Horizon-0.9B` | `IFM/K2-Horizon-0.9B-GGUF:K2-Horizon-1B-BF16.gguf` | 2.16 GB |
-| `user.K2-Horizon-3.7B` | `IFM/K2-Horizon-3.7B-GGUF:K2-Horizon-4B-BF16.gguf` | 10.13 GB |
-| `user.K2-Horizon-7B` | `IFM/K2-Horizon-7B-GGUF:K2-Horizon-7B-BF16.gguf` | 18.01 GB |
+| Name | BF16 weight size |
+|---|---:|
+| `user.K2-Horizon-0.9B` | 2.16 GB |
+| `user.K2-Horizon-3.7B` | 10.13 GB |
+| `user.K2-Horizon-7B` | 18.01 GB |
+| `user.K2-Horizon-32B` | 69.57 GB |
+| `user.K2-Horizon-MoVA-36B-A4B` | 74.92 GB |
+
+The 375B model is intentionally not implemented in the IFM llama.cpp branch
+and cannot be used through this integration.
 
 Context and compute buffers require additional memory. Start with a bounded context:
 
