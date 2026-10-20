@@ -28,7 +28,6 @@ using namespace lemon::utils;
 namespace lemon {
 namespace backends {
 
-
 namespace {
 bool is_rocm_backend(const std::string& backend) {
     return backend == "rocm" || backend == "rocm-stable";
@@ -88,7 +87,7 @@ int generate_random_seed() {
 
 InstallParams SDServer::get_install_params(const std::string& backend, const std::string& version) {
     InstallParams params;
-    params.repo = "leejet/stable-diffusion.cpp";
+    params.repo = "lemonade-sdk/stable-diffusion.cpp";
     std::string resolved_backend = resolve_sdcpp_backend(backend);
 
     // Transform generated sd.cpp versions for asset names:
@@ -144,7 +143,6 @@ InstallParams SDServer::get_install_params(const std::string& backend, const std
         throw std::runtime_error("Vulkan sd.cpp only supported on Windows and Linux");
     #endif
     } else if (is_cuda_backend(resolved_backend)) {
-        params.repo = "lemonade-sdk/stable-diffusion.cpp";
         std::string target_arch = SystemInfo::get_cuda_arch();
         if (target_arch.empty()) {
             throw std::runtime_error(
@@ -179,10 +177,6 @@ InstallParams SDServer::get_install_params(const std::string& backend, const std
 SDServer::SDServer(const std::string& log_level, ModelManager* model_manager, BackendManager* backend_manager)
     : WrappedServer("sd-server", log_level, model_manager, backend_manager) {
     LOG(DEBUG, "SDServer") << "Created with log_level=" << log_level << std::endl;
-}
-
-SDServer::~SDServer() {
-    unload();
 }
 
 void SDServer::load(const std::string& model_name,
@@ -333,19 +327,7 @@ void SDServer::load(const std::string& model_name,
                         new_path = *it + ";" + new_path;
                     }
 
-                    fs::path therock_dll = fs::path(therock_bin) / "amdhip64_7.dll";
-                    fs::path target_dll = exe_dir / "amdhip64_7.dll";
-                    if (fs::exists(therock_dll)) {
-                        std::error_code ec;
-                        fs::copy_file(therock_dll, target_dll, fs::copy_options::overwrite_existing, ec);
-                        if (!ec) {
-                            LOG(INFO, "SDServer") << "Copied amdhip64_7.dll from TheRock to " << path_to_utf8(target_dll) << std::endl;
-                        } else {
-                            LOG(ERROR, "SDServer") << "Failed to copy amdhip64_7.dll: " << ec.message() << std::endl;
-                        }
-                    } else {
-                        LOG(DEBUG, "SDServer") << "amdhip64_7.dll not found in TheRock at " << path_to_utf8(therock_dll) << std::endl;
-                    }
+                    BackendUtils::stage_therock_hip_runtime(rocm_arch, exe_dir);
                 }
             }
         }
@@ -383,37 +365,14 @@ void SDServer::load(const std::string& model_name,
     working_dir = path_to_utf8(executable_path.parent_path());
 #endif
 
-    ProcessHandle started_handle = utils::ProcessManager::start_process(
-        process_exe_path,
-        args,
-        working_dir,
-        is_debug(),  // inherit_output
-        false,  // filter_health_logs
-        env_vars
-    );
-    set_process_handle(started_handle, process_exe_path, args);
-
-    if (!has_process_handle(started_handle)) {
-        throw std::runtime_error("Failed to start sd-server process");
-    }
-
-    LOG(INFO, "SDServer") << "Process started with PID: " << started_handle.pid << std::endl;
-
-    if (!wait_for_ready("/")) {
-        unload();
-        throw std::runtime_error("sd-server failed to start or become ready");
-    }
-
-    LOG(INFO, "SDServer") << "Server is ready at http://127.0.0.1:" << get_backend_port() << std::endl;
-}
-
-void SDServer::unload() {
-    stop_backend_watchdog();
-    const ProcessHandle handle = consume_process_handle_for_cleanup();
-    if (has_process_handle(handle)) {
-        LOG(INFO, "SDServer") << "Stopping server (PID: " << handle.pid << ")" << std::endl;
-        utils::ProcessManager::stop_process(handle);
-    }
+    ServerCommand command;
+    command.program = process_exe_path;
+    command.args = std::move(args);
+    command.env = std::move(env_vars);
+    command.port = port_;
+    command.ready_endpoint = "/";
+    start_server(std::make_unique<NativeProcess>(ProcessOutput{is_debug(), false}, working_dir),
+                 command);
 }
 
 json SDServer::build_extra_args(const json& request, bool include_flow_shift) const {
@@ -584,10 +543,25 @@ json SDServer::image_edits(const json& request) {
         fields.push_back({"size", size, "", ""});
     }
 
-    if (request.contains("image_data")) {
+    if (request.contains("image_files") && request["image_files"].is_array()
+        && !request["image_files"].empty()) {
+        // A repeated multipart image[] is one reference, in its upload order.
+        for (const auto& image : request["image_files"]) {
+            std::string image_binary = JsonUtils::base64_decode(
+                image.at("data").get<std::string>());
+            std::string filename = image.value("filename", std::string("image.png"));
+            std::string mime = image.value("content_type", std::string("application/octet-stream"));
+            fields.push_back({"image[]", image_binary,
+                              filename.empty() ? "image.png" : filename,
+                              mime.empty() ? "application/octet-stream" : mime});
+        }
+    } else if (request.contains("image_data")) {
+        // Backward compatibility for direct single-image requests.
         std::string image_binary = JsonUtils::base64_decode(
             request["image_data"].get<std::string>());
-        fields.push_back({"image[]", image_binary, "image.png", "image/png"});
+        fields.push_back({"image[]", image_binary,
+                          request.value("image_filename", std::string("image.png")),
+                          request.value("image_content_type", std::string("image/png"))});
     }
     if (request.contains("mask_data")) {
         std::string mask_binary = JsonUtils::base64_decode(
@@ -717,19 +691,7 @@ std::string SDServer::upscale_via_cli(
         env_vars.push_back({"PATH", new_path});
 
         if (!therock_dirs.empty()) {
-            fs::path therock_dll = fs::path(therock_dirs.front()) / "amdhip64_7.dll";
-            fs::path target_dll = cli_exe.parent_path() / "amdhip64_7.dll";
-            if (fs::exists(therock_dll)) {
-                std::error_code ec;
-                fs::copy_file(therock_dll, target_dll, fs::copy_options::overwrite_existing, ec);
-                if (!ec) {
-                    LOG(INFO, "SDServer") << "Copied amdhip64_7.dll from TheRock to "
-                        << path_to_utf8(target_dll) << std::endl;
-                } else {
-                    LOG(ERROR, "SDServer") << "Failed to copy amdhip64_7.dll: "
-                        << ec.message() << std::endl;
-                }
-            }
+            BackendUtils::stage_therock_hip_runtime(rocm_arch, cli_exe.parent_path());
         }
     }
 #endif
@@ -827,7 +789,6 @@ namespace sdcpp {
 std::unique_ptr<WrappedServer> create(const BackendContext& ctx) {
     return make_server<SDServer>(ctx);
 }
-
 
 const BackendSpec* spec() { return make_spec<SDServer>(descriptor); }
 const BackendOps* ops() { return default_backend_ops(); }

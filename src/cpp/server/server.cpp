@@ -1,4 +1,5 @@
 #include "lemon/server.h"
+#include "lemon/api_docs.h"
 #include "lemon/audio_types.h"
 #include "lemon/auto_tune.h"
 #include "lemon/error_types.h"
@@ -13,19 +14,19 @@
 #include "lemon/config_file.h"
 #include "lemon/jobs/job_manager.h"
 #include "lemon/mcp_server.h"
-#include "lemon/mcp_client.h"
 #include "lemon/ollama_api.h"
 #include "lemon/backends/backend_descriptor_registry.h"
+#include "lemon/backends/backend_registry.h"
 #include "lemon/backends/cloud/cloud_server.h"
-#include "lemon/backends/sdcpp/sdcpp_server.h"
-#include "lemon/backends/thenoise/thenoise_server.h"
 #include "lemon/backends/backend_utils.h"
+#include "lemon/model_types.h"
 #include <cstring>
 #include "lemon/utils/conversation_fingerprint.h"
 #include "lemon/utils/image_sniff.h"
 #include "lemon/utils/json_utils.h"
 #include "lemon/utils/model_name_utils.h"
 #include "lemon/utils/path_utils.h"
+#include "lemon/utils/session_utils.h"
 #include "lemon/streaming_proxy.h"
 #include "lemon/logging_config.h"
 #include "lemon/thinking_controls.h"
@@ -41,6 +42,7 @@
 #include <iomanip>
 #include <sstream>
 #include <fstream>
+#include <limits>
 #include <map>
 #include <memory>
 #include <thread>
@@ -88,7 +90,92 @@ namespace lemon {
 
 namespace {
 
+nlohmann::json gpu_device_details_json(const SystemGpuMetrics& snapshot) {
+    nlohmann::json result;
+    result["primary_gpu_id"] = snapshot.primary_gpu_id.empty()
+        ? nlohmann::json() : nlohmann::json(snapshot.primary_gpu_id);
+    result["gpus"] = nlohmann::json::array();
+    for (const auto& gpu : snapshot.gpus) {
+        nlohmann::json entry;
+        entry["id"] = gpu.id;
+        entry["vendor"] = gpu.vendor;
+        entry["name"] = gpu.name;
+        entry["memory_type"] = gpu.memory_type;
+        entry["gpu_percent"] = gpu.gpu_percent >= 0.0
+            ? nlohmann::json(gpu.gpu_percent) : nlohmann::json();
+        entry["memory_total_gb"] = gpu.memory_total_gb >= 0.0
+            ? nlohmann::json(gpu.memory_total_gb) : nlohmann::json();
+        entry["memory_used_gb"] = gpu.memory_used_gb >= 0.0
+            ? nlohmann::json(gpu.memory_used_gb) : nlohmann::json();
+        result["gpus"].push_back(std::move(entry));
+    }
+    return result;
+}
 
+std::optional<std::pair<int, int>> image_dimensions_from_bytes(const std::string& bytes) {
+    auto at = [&bytes](size_t i) -> std::uint8_t {
+        return static_cast<std::uint8_t>(bytes[i]);
+    };
+    if (bytes.size() >= 24 &&
+        bytes.compare(0, 8, "\x89PNG\r\n\x1a\n", 8) == 0 &&
+        bytes.compare(12, 4, "IHDR", 4) == 0) {
+        auto be32 = [&](size_t i) -> std::uint32_t {
+            return (std::uint32_t(at(i)) << 24) | (std::uint32_t(at(i + 1)) << 16) |
+                   (std::uint32_t(at(i + 2)) << 8) | std::uint32_t(at(i + 3));
+        };
+        const auto width = be32(16);
+        const auto height = be32(20);
+        if (width > 0 && height > 0 &&
+            width <= static_cast<std::uint32_t>(std::numeric_limits<int>::max()) &&
+            height <= static_cast<std::uint32_t>(std::numeric_limits<int>::max())) {
+            return std::pair<int, int>{static_cast<int>(width), static_cast<int>(height)};
+        }
+    }
+    if (bytes.size() >= 4 && at(0) == 0xff && at(1) == 0xd8) {
+        size_t pos = 2;
+        while (pos < bytes.size()) {
+            if (at(pos) != 0xff) break;
+            while (pos < bytes.size() && at(pos) == 0xff) ++pos;
+            if (pos >= bytes.size()) break;
+            const auto marker = at(pos++);
+            if (marker == 0xd9 || marker == 0xda) break;
+            if (marker == 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+            if (bytes.size() - pos < 2) break;
+            const size_t segment_len = (size_t(at(pos)) << 8) | at(pos + 1);
+            if (segment_len < 2 || segment_len > bytes.size() - pos) break;
+            const bool sof = marker >= 0xc0 && marker <= 0xcf &&
+                             marker != 0xc4 && marker != 0xc8 && marker != 0xcc;
+            if (sof && segment_len >= 7) {
+                const int height = (int(at(pos + 3)) << 8) | at(pos + 4);
+                const int width = (int(at(pos + 5)) << 8) | at(pos + 6);
+                if (width > 0 && height > 0) return std::pair<int, int>{width, height};
+            }
+            pos += segment_len;
+        }
+    }
+    return std::nullopt;
+}
+
+// Default soft cap for inferred image-edit dimensions.
+constexpr std::uint64_t kDefaultMaxEditPixels = 2048ULL * 2048ULL;
+
+std::pair<int, int> cap_image_area(int width, int height, std::uint64_t max_pixels) {
+    const auto pixels = static_cast<std::uint64_t>(width) * height;
+    if (pixels <= max_pixels) return {width, height};
+
+    const double scale = std::sqrt(static_cast<double>(max_pixels) / pixels);
+    int scaled_width = std::max(1, static_cast<int>(width * scale));
+    int scaled_height = std::max(1, static_cast<int>(height * scale));
+    // A dimension rounded up to one pixel must not violate the area cap.
+    if (static_cast<std::uint64_t>(scaled_width) * scaled_height > max_pixels) {
+        if (scaled_width > scaled_height) {
+            scaled_width = static_cast<int>(max_pixels / scaled_height);
+        } else {
+            scaled_height = static_cast<int>(max_pixels / scaled_width);
+        }
+    }
+    return {scaled_width, scaled_height};
+}
 
 // Normalize client-provided model names: strip ":latest" suffix (Ollama/Docker convention)
 // Returns true if the model name was modified
@@ -392,6 +479,8 @@ Server::Server(std::shared_ptr<RuntimeConfig> config,
     alias_manager_ = std::make_unique<AliasManager>(cache_dir_);
     model_manager_ = std::make_unique<ModelManager>(config_->extra_models_dir());
     model_manager_->set_cloud_registry(cloud_registry_.get());
+    model_manager_->set_default_model_source_provider(
+        [this]() { return config_->default_model_source(); });
 
     backend_manager_ = std::make_unique<BackendManager>();
     BackendManager::set_global(backend_manager_.get());
@@ -443,11 +532,17 @@ Server::Server(std::shared_ptr<RuntimeConfig> config,
             stats["cpu_percent"] =
                 cpu_percent >= 0 ? lemon::jobs::json(cpu_percent) : lemon::jobs::json();
             stats["memory_gb"] = metrics_platform_->get_memory_usage_gb();
-            const double gpu_percent = get_gpu_usage();
-            stats["gpu_percent"] =
-                gpu_percent >= 0 ? lemon::jobs::json(gpu_percent) : lemon::jobs::json();
-            const double vram_gb = get_vram_usage();
-            stats["vram_gb"] = vram_gb >= 0 ? lemon::jobs::json(vram_gb) : lemon::jobs::json();
+            const auto gpu_metrics = metrics_platform_->get_system_gpu_metrics();
+            stats["gpu_percent"] = gpu_metrics.gpu_percent >= 0
+                ? lemon::jobs::json(gpu_metrics.gpu_percent)
+                : lemon::jobs::json();
+            stats["vram_gb"] = gpu_metrics.vram_used_gb >= 0
+                ? lemon::jobs::json(gpu_metrics.vram_used_gb)
+                : lemon::jobs::json();
+            const auto gpu_details = gpu_device_details_json(gpu_metrics);
+            stats["primary_gpu_id"] = lemon::jobs::json::parse(
+                gpu_details["primary_gpu_id"].dump());
+            stats["gpus"] = lemon::jobs::json::parse(gpu_details["gpus"].dump());
             const double npu_percent = get_npu_utilization();
             stats["npu_percent"] =
                 npu_percent >= 0 ? lemon::jobs::json(npu_percent) : lemon::jobs::json();
@@ -940,80 +1035,20 @@ httplib::Server::HandlerResponse Server::authenticate_request(const httplib::Req
     telemetry::g_incoming_client_id.clear();
     telemetry::g_incoming_session_id.clear();
 
-    auto trim = [](const std::string& str) -> std::string {
-        size_t s = str.find_first_not_of(" \t\r\n");
-        if (s == std::string::npos) return "";
-        size_t e = str.find_last_not_of(" \t\r\n");
-        return str.substr(s, e - s + 1);
-    };
-
-    std::string client_val;
-    if (config_) {
-        for (const auto& hdr : config_->telemetry_session_headers_client()) {
-            std::string cleaned_hdr = trim(hdr);
-            if (!cleaned_hdr.empty() && req.has_header(cleaned_hdr)) {
-                std::string val = trim(req.get_header_value(cleaned_hdr));
-                if (!val.empty()) {
-                    client_val = val;
-                    break;
-                }
-            }
-        }
-    }
-    if (client_val.empty()) {
-        static const char* kWellKnownClientHeaders[] = {
-            "x-opencode-client",
-            "x-client-id",
-            "x-client-name"
-        };
-        for (const char* hdr : kWellKnownClientHeaders) {
-            if (req.has_header(hdr)) {
-                std::string val = trim(req.get_header_value(hdr));
-                if (!val.empty()) {
-                    client_val = val;
-                    break;
-                }
-            }
-        }
+    session::SessionContext telemetry_session = config_
+        ? session::resolve_session_context(
+              req,
+              config_->telemetry_session_headers_id(),
+              config_->telemetry_session_headers_client())
+        : session::resolve_session_context(req, {}, {});
+    if (!telemetry_session.session_id.empty()) {
+        telemetry::g_incoming_client_id = telemetry_session.client_id;
+        telemetry::g_incoming_session_id = telemetry_session.session_id;
     }
 
-    std::string session_val;
-    if (config_) {
-        for (const auto& hdr : config_->telemetry_session_headers_id()) {
-            std::string cleaned_hdr = trim(hdr);
-            if (!cleaned_hdr.empty() && req.has_header(cleaned_hdr)) {
-                std::string val = trim(req.get_header_value(cleaned_hdr));
-                if (!val.empty()) {
-                    session_val = val;
-                    break;
-                }
-            }
-        }
-    }
-    if (session_val.empty()) {
-        static const char* kWellKnownSessionHeaders[] = {
-            "x-opencode-session",
-            "x-session-id",
-            "x-client-session-id",
-            "mcp-session-id",
-            "x-conversation-id",
-            "session-id"
-        };
-        for (const char* hdr : kWellKnownSessionHeaders) {
-            if (req.has_header(hdr)) {
-                std::string val = trim(req.get_header_value(hdr));
-                if (!val.empty()) {
-                    session_val = val;
-                    break;
-                }
-            }
-        }
-    }
-
-    if (!session_val.empty()) {
-        telemetry::g_incoming_client_id = client_val;
-        telemetry::g_incoming_session_id = session_val;
-    }
+    // Reset every request so a reused worker thread can't leak the prior
+    // caller's session to a cloud provider.
+    session::g_request_session = session::resolve_forwardable_session(req);
 
     // Check if path requires authentication (API routes and internal endpoints).
     // /mcp is included here so that LEMONADE_API_KEY enforcement covers the MCP
@@ -1036,9 +1071,7 @@ httplib::Server::HandlerResponse Server::authenticate_request(const httplib::Req
     //   when LEMONADE_ADMIN_API_KEY is unset, admin_api_key_ == api_key_, so the
     //   regular key also authenticates against /internal/*.
     // - If api_key_ is empty, the regular endpoints require no authentication.
-    // - If admin_api_key_ is empty (neither key set), legacy /internal/* routes
-    //   require no authentication. The MCP process-launch surface is deliberately
-    //   fail-closed and requires an explicitly configured admin key.
+    // - If admin_api_key_ is empty (neither key set), /internal/* requires none.
 
     // Safely extract bearer token, guarding against malformed Authorization headers
     std::string auth_token;
@@ -1057,23 +1090,7 @@ httplib::Server::HandlerResponse Server::authenticate_request(const httplib::Req
 
     telemetry::g_current_auth_token = auth_token;
 
-    const bool is_mcp_internal_route =
-        req.path == "/internal/mcp" ||
-        req.path.rfind("/internal/mcp/", 0) == 0;
-
     if (is_internal_route) {
-        // MCP server registration can launch arbitrary local processes. Do not
-        // expose that capability on a keyless server, even on loopback: permissive
-        // CORS would otherwise let an unrelated web page drive these endpoints.
-        // Apply this to OPTIONS as well so a browser preflight fails closed.
-        if (is_mcp_internal_route && admin_api_key_.empty()) {
-            res.status = 403;
-            res.set_content(
-                "{\"error\": \"MCP administration requires LEMONADE_ADMIN_API_KEY or LEMONADE_API_KEY\"}",
-                "application/json");
-            return httplib::Server::HandlerResponse::Handled;
-        }
-
         // Internal routes require admin key authentication
         if (!admin_api_key_.empty() && req.method != "OPTIONS") {
             if (auth_token != admin_api_key_) {
@@ -1189,6 +1206,18 @@ void Server::setup_routes(httplib::Server &web_server) {
     register_get("health", [this](const httplib::Request& req, httplib::Response& res) {
         handle_health(req, res);
     });
+
+    // API reference bundled with the server. The index is fetched first; each entry
+    // carries the URL of the document, so clients never build doc paths themselves.
+    register_get("docs", [this](const httplib::Request& req, httplib::Response& res) {
+        handle_docs(req, res);
+    });
+    for (const char* prefix : {"/api/v0", "/api/v1", "/v0", "/v1"}) {
+        web_server.Get(std::string(prefix) + R"(/docs/(.+))",
+                       [this](const httplib::Request& req, httplib::Response& res) {
+            handle_doc_page(req, res);
+        });
+    }
 
     // Models endpoints
     register_get("models", [this](const httplib::Request& req, httplib::Response& res) {
@@ -1484,11 +1513,6 @@ void Server::setup_routes(httplib::Server &web_server) {
         handle_aliases_remove(req, res);
     });
 
-    // Server-side MCP client host foundation (admin-gated through the existing
-    // /internal/* pre-routing auth). GUI3 and the web UI can both use these
-    // endpoints via the normal Lemonade server connection.
-    register_mcp_client_routes(web_server, cache_dir_, config_dir_);
-
     // Cloud auth: register quad-prefix POST and a parameterized DELETE.
     //   POST /v1/cloud/auth        body: {provider, api_key}
     //   DELETE /v1/cloud/auth/{p}
@@ -1566,8 +1590,12 @@ void Server::setup_static_files(httplib::Server &web_server) {
                 {"recipe", info.recipe},
                 {"labels", info.labels},
                 {"suggested", info.suggested},
-                {"source", info.source.empty() ? info.registry_source : info.source},
-                {"registry_source", info.registry_source},
+                {"source", info.source.empty()
+                    ? remote_registry_source_name(
+                        parse_remote_registry_source(info.registry_source))
+                    : info.source},
+                {"registry_source", remote_registry_source_name(
+                    parse_remote_registry_source(info.registry_source))},
                 {"components", public_components},
                 {"mmproj", info.mmproj()}
             };
@@ -1834,10 +1862,9 @@ window.api = {
             std::string file_path = req.matches[1].str();
             serve_web_app_asset(req, res, file_path);
         });
-
         // SPA fallback: serve index.html for any unmatched GET routes that don't start with /api, /v0, /v1, /static, or /live
         // This enables client-side routing
-        web_server.Get(R"(^(?!/api|/v0|/v1|/static|/live|/status|/internal).*)",
+        web_server.Get(R"(^(?!/api|/v0|/v1|/static|/live|/status|/internal|/docs(/|$)).*)",
                       [serve_web_app_html](const httplib::Request& req, httplib::Response& res) {
             // Only serve index.html if the path doesn't look like a file with extension
             std::string path = req.path;
@@ -1880,6 +1907,13 @@ window.api = {
             }
         });
     }
+
+    auto docs_not_found = [](const httplib::Request&, httplib::Response& res) {
+        res.status = 404;
+        res.set_content("{\"error\": \"Not Found. For API documentation, use /v1/docs.\"}", "application/json");
+    };
+    web_server.Get("/docs", docs_not_found);
+    web_server.Get(R"(/docs/(.*))", docs_not_found);
 
     // Override default headers for static files to include no-cache
     // This ensures the web UI always gets the latest version
@@ -2078,10 +2112,9 @@ void Server::run() {
             LOG(WARNING, "Server")
                 << "Serving on non-loopback host '" << bound_host
                 << "' without an API key. All endpoints, including the /internal/* "
-                   "control endpoints and the /internal/mcp/* process-launch endpoints, "
-                   "are reachable from other machines unauthenticated. Set "
-                   "LEMONADE_API_KEY to secure all endpoints; LEMONADE_ADMIN_API_KEY "
-                   "on its own only secures the /internal/* "
+                   "control endpoints, are reachable from other machines "
+                   "unauthenticated. Set LEMONADE_API_KEY to secure all endpoints; "
+                   "LEMONADE_ADMIN_API_KEY on its own only secures the /internal/* "
                    "control endpoints." << std::endl;
         } else if (api_key_.empty()) {
             LOG(WARNING, "Server")
@@ -2661,6 +2694,45 @@ void Server::handle_live(const httplib::Request& req, httplib::Response& res) {
     res.status = 200;
 }
 
+void Server::handle_docs(const httplib::Request& req, httplib::Response& res) {
+    std::string docs_dir = utils::get_resource_path("resources/docs");
+
+    // Echo back the prefix the client used so the URLs stay valid on all four.
+    std::string prefix = req.path.substr(0, req.path.size() - std::string("/docs").size());
+
+    nlohmann::json docs = nlohmann::json::array();
+    for (const ApiDoc& doc : list_api_docs(docs_dir)) {
+        docs.push_back({
+            {"id", doc.id},
+            {"title", doc.title},
+            {"url", prefix + "/docs/" + doc.id},
+            {"bytes", doc.bytes}
+        });
+    }
+
+    nlohmann::json body = {
+        {"version", LEMON_VERSION_STRING},
+        {"format", "text/markdown"},
+        {"docs", docs}
+    };
+    res.set_content(body.dump(2), "application/json");
+    res.status = 200;
+}
+
+void Server::handle_doc_page(const httplib::Request& req, httplib::Response& res) {
+    std::string docs_dir = utils::get_resource_path("resources/docs");
+
+    std::string content;
+    if (!read_api_doc(docs_dir, req.matches[1].str(), content)) {
+        res.status = 404;
+        res.set_content("{\"error\": \"Documentation page not found\"}", "application/json");
+        return;
+    }
+
+    res.set_content(content, "text/markdown");
+    res.status = 200;
+}
+
 void Server::handle_model_update_check(const httplib::Request& req, httplib::Response& res) {
     (void)req;
 
@@ -3208,8 +3280,12 @@ nlohmann::json Server::model_info_to_json(const std::string& model_id, const Mod
         {"downloaded", info.downloaded},
         {"update_available", info.update_available},
         {"suggested", info.suggested},
-        {"source", info.source.empty() ? info.registry_source : info.source},
-        {"registry_source", info.registry_source},
+        {"source", info.source.empty()
+            ? remote_registry_source_name(
+                parse_remote_registry_source(info.registry_source))
+            : info.source},
+        {"registry_source", remote_registry_source_name(
+            parse_remote_registry_source(info.registry_source))},
         {"labels", info.labels},
         {"components", public_components},
         {"recipe_options", info.recipe_options.to_json()},
@@ -3237,6 +3313,11 @@ nlohmann::json Server::model_info_to_json(const std::string& model_id, const Mod
     const int64_t context_length = resolve_context_length(model_id, info);
     if (context_length > 0) {
         model_json["context_length"] = context_length;
+    }
+
+    if (info.max_output_tokens > 0) {
+        model_json["max_output_tokens"] = info.max_output_tokens;
+        model_json["max_completion_tokens"] = info.max_output_tokens;
     }
 
     // Per-million-token pricing in USD, when the provider reported it (cloud
@@ -3272,6 +3353,8 @@ nlohmann::json Server::model_info_to_json(const std::string& model_id, const Mod
             img_def["sampling_method"] = info.image_defaults.sampling_method;
         if (info.image_defaults.flow_shift > 0.0f)
             img_def["flow_shift"] = info.image_defaults.flow_shift;
+        if (info.image_defaults.soft_pixel_cap > 0)
+            img_def["soft_pixel_cap"] = info.image_defaults.soft_pixel_cap;
         model_json["image_defaults"] = img_def;
     }
 
@@ -3486,8 +3569,11 @@ void Server::respond_with_model_options(
 
         const int64_t auto_ctx = resolve_auto_ctx_size(effective, info);
         const nlohmann::json effective_ctx = effective.get_option("ctx_size");
-        const int64_t resolved_ctx = auto_ctx != -2 ? auto_ctx
-            : (effective_ctx.is_number() ? effective_ctx.get<int64_t>() : -1);
+        nlohmann::json resolved_ctx = nullptr;
+        if (auto_ctx != AUTO_CTX_NO_CAPACITY) {
+            resolved_ctx = auto_ctx != -2 ? auto_ctx
+                : (effective_ctx.is_number() ? effective_ctx.get<int64_t>() : -1);
+        }
 
         nlohmann::json response = {
             {"model_name", model_id},
@@ -3903,6 +3989,12 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
     nlohmann::json request_json;
     if (!parse_required_json_body(req, res, request_json)) return;
 
+    utils::RequestCancelToken cancel_token;
+    if (req.is_connection_closed) {
+        cancel_token.should_cancel = [is_closed = req.is_connection_closed]() { return is_closed && is_closed(); };
+    }
+    WrappedServer::RequestCancelScope cancel_scope(cancel_token);
+
     try {
 
         // Normalize client-provided model names (e.g., strip ":latest" suffix)
@@ -4080,6 +4172,12 @@ void Server::handle_chat_completions(const httplib::Request& req, httplib::Respo
 }
 
 void Server::handle_completions(const httplib::Request& req, httplib::Response& res) {
+    utils::RequestCancelToken cancel_token;
+    if (req.is_connection_closed) {
+        cancel_token.should_cancel = [is_closed = req.is_connection_closed]() { return is_closed && is_closed(); };
+    }
+    WrappedServer::RequestCancelScope cancel_scope(cancel_token);
+
     try {
         auto request_json = nlohmann::json::parse(req.body);
 
@@ -5292,16 +5390,43 @@ bool Server::parse_n_from_form(const httplib::Request& req, httplib::Response& r
     return true;
 }
 
-bool Server::extract_image_from_form(const httplib::Request& req, httplib::Response& res, nlohmann::json& out) {
+bool Server::extract_image_from_form(const httplib::Request& req, httplib::Response& res, nlohmann::json& out, bool allow_multiple) {
+    // A multipart map groups files by field name, losing mixed upload order.
+    if (allow_multiple && req.form.files.count("image") > 0 &&
+        req.form.files.count("image[]") > 0) {
+        res.status = 400;
+        nlohmann::json error = {{"error", {
+            {"message", "Use either 'image' or 'image[]', not both"},
+            {"type", "invalid_request_error"}
+        }}};
+        res.set_content(error.dump(), "application/json");
+        return false;
+    }
+    nlohmann::json images = nlohmann::json::array();
     for (const auto& file_pair : req.form.files) {
         if (file_pair.first == "image" || file_pair.first == "image[]") {
             const auto& file = file_pair.second;
-            out["image_data"] = utils::JsonUtils::base64_encode(file.content);
-            out["image_filename"] = file.filename;
+            const std::string encoded = utils::JsonUtils::base64_encode(file.content);
+            if (!out.contains("image_data")) {
+                // Keep the existing single-image contract for other callers.
+                out["image_data"] = encoded;
+                out["image_filename"] = file.filename;
+                out["image_content_type"] = file.content_type;
+            }
             LOG(INFO, "Server") << "Image file: " << file.filename
                       << " (" << file.content.size() << " bytes)" << std::endl;
-            return true;
+            if (!allow_multiple) return true;
+            // Preserve original upload bytes, MIME and reference order.
+            images.push_back({
+                {"data", encoded},
+                {"filename", file.filename},
+                {"content_type", file.content_type},
+            });
         }
+    }
+    if (!images.empty()) {
+        out["image_files"] = std::move(images);
+        return true;
     }
     res.status = 400;
     nlohmann::json error = {{"error", {
@@ -5426,7 +5551,32 @@ void Server::handle_image_edits(const httplib::Request& req, httplib::Response& 
         if (!parse_int_field("seed"))      return;
 
         if (!parse_n_from_form(req, res, request_json))      return;
-        if (!extract_image_from_form(req, res, request_json)) return;
+        if (!extract_image_from_form(req, res, request_json, /*allow_multiple=*/true)) return;
+
+        // The first uploaded image sets the output size unless explicitly provided.
+        if (!request_json.contains("size")) {
+            std::uint64_t soft_pixel_cap = kDefaultMaxEditPixels;
+            if (request_json.contains("model") && request_json["model"].is_string()) {
+                const auto model = router_->try_get_model_info(
+                    resolve_alias_target(request_json["model"].get<std::string>()));
+                if (model && model->image_defaults.soft_pixel_cap > 0) {
+                    soft_pixel_cap = model->image_defaults.soft_pixel_cap;
+                }
+            }
+            for (const auto& file_pair : req.form.files) {
+                if (file_pair.first != "image" && file_pair.first != "image[]") continue;
+                const auto original = image_dimensions_from_bytes(file_pair.second.content);
+                if (original) {
+                    const auto [width, height] = cap_image_area(
+                        original->first, original->second, soft_pixel_cap);
+                    request_json["size"] = std::to_string(width) + "x" + std::to_string(height);
+                } else {
+                    LOG(WARNING, "Server") << "Cannot determine source image dimensions; "
+                        "using backend defaults" << std::endl;
+                }
+                break;
+            }
+        }
 
         // Extract optional mask file
         for (const auto& file_pair : req.form.files) {
@@ -5557,10 +5707,19 @@ void Server::handle_image_upscale(const httplib::Request& req, httplib::Response
             return;
         }
 
-        std::string upscale_model_path;
-        std::string recipe;
+        ModelInfo info;
         try {
-            auto info = model_manager_->get_model_info(upscale_model_name);
+            info = model_manager_->get_model_info(upscale_model_name);
+
+            if (!lemon::has_label(info.labels, "upscaling")) {
+                res.status = 400;
+                nlohmann::json error = {{"error", {
+                    {"message", "Upscale model is not labeled 'upscaling': " + upscale_model_name},
+                    {"type", "invalid_request_error"}
+                }}};
+                res.set_content(error.dump(), "application/json");
+                return;
+            }
 
             if (!model_manager_->is_model_downloaded(upscale_model_name)) {
                 LOG(INFO, "Server") << "Upscale model not cached, downloading from its remote registry..." << std::endl;
@@ -5569,8 +5728,6 @@ void Server::handle_image_upscale(const httplib::Request& req, httplib::Response
                 info = model_manager_->get_model_info(upscale_model_name);
             }
 
-            upscale_model_path = info.resolved_path("main");
-            recipe = info.recipe;
         } catch (const std::exception& e) {
             res.status = 404;
             nlohmann::json error = {{"error", {
@@ -5583,24 +5740,24 @@ void Server::handle_image_upscale(const httplib::Request& req, httplib::Response
 
         std::string b64_image = request_json["image"].get<std::string>();
 
-        // Upscaling is model-free: no model is loaded through the router, so we
-        // dispatch by recipe to each backend's shared upscale API, which shells
-        // out to its own CLI binary directly (backend selection, binary path,
-        // and runtime environment all live in the backend).
-        std::string upscaled;
-        if (recipe == "thenoise") {
-            upscaled = lemon::backends::TheNoiseServer::upscale_via_cli(b64_image, upscale_model_path);
-        } else if (recipe == "sd-cpp") {
-            upscaled = lemon::backends::SDServer::upscale_via_cli(b64_image, upscale_model_path);
-        } else {
+        backends::BackendContext context;
+        context.log_level = config_->log_level();
+        context.model_manager = model_manager_.get();
+        context.backend_manager = backend_manager_.get();
+        context.cloud_registry = cloud_registry_.get();
+        context.model_info = &info;
+        auto server = backends::create_server(info.recipe, context);
+        if (!server || !supports_capability<IUpscaleServer>(server.get())) {
             res.status = 400;
             nlohmann::json error = {{"error", {
-                {"message", "Upscale is not supported by recipe: " + recipe},
+                {"message", "Upscale is not supported by recipe: " + info.recipe},
                 {"type", "invalid_request_error"}
             }}};
             res.set_content(error.dump(), "application/json");
             return;
         }
+        auto* upscale_server = dynamic_cast<IUpscaleServer*>(server.get());
+        std::string upscaled = upscale_server->upscale_via_cli(b64_image, info.resolved_path("main"));
 
         if (upscaled.empty()) {
             res.status = 500;
@@ -5638,6 +5795,12 @@ void Server::handle_image_upscale(const httplib::Request& req, httplib::Response
 }
 
 void Server::handle_responses(const httplib::Request& req, httplib::Response& res) {
+    utils::RequestCancelToken cancel_token;
+    if (req.is_connection_closed) {
+        cancel_token.should_cancel = [is_closed = req.is_connection_closed]() { return is_closed && is_closed(); };
+    }
+    WrappedServer::RequestCancelScope cancel_scope(cancel_token);
+
     try {
         auto request_json = nlohmann::json::parse(req.body);
         normalize_client_model_name(request_json);
@@ -5824,6 +5987,11 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         nlohmann::json download_request = collection_file_import
             ? request_json
             : nlohmann::json::object();
+        for (const char* field : {"source", "registry_source"}) {
+            if (request_json.contains(field)) {
+                download_request[field] = request_json[field];
+            }
+        }
 
         if (stream) {
             auto operation = [this, model_name, download_request, do_not_upgrade](DownloadProgressCallback progress_cb) {
@@ -5866,6 +6034,14 @@ void Server::handle_pull(const httplib::Request& req, httplib::Response& res) {
         LOG(ERROR, "Server") << "ERROR in handle_pull: " << e.what() << std::endl;
         res.status = 400;
         nlohmann::json error = {{"error", e.what()}};
+        res.set_content(error.dump(), "application/json");
+    } catch (const lemon::RegistryRateLimitError& e) {
+        LOG(WARNING, "Server") << "Registry unavailable in handle_pull: " << e.what() << std::endl;
+        res.status = 503;
+        res.set_header("Retry-After", std::to_string(e.retry_after_seconds()));
+        nlohmann::json error = {{"error", e.what()},
+                                {"code", lemon::kRegistryUnavailableErrorCode},
+                                {"upstream_status_code", e.status_code()}};
         res.set_content(error.dump(), "application/json");
     } catch (const std::exception& e) {
         LOG(ERROR, "Server") << "ERROR in handle_pull: " << e.what() << std::endl;
@@ -6848,8 +7024,9 @@ void Server::handle_metrics(const httplib::Request& req, httplib::Response& res)
     try {
         SystemMetrics system_metrics;
         system_metrics.cpu_percent = get_cpu_usage();
-        system_metrics.gpu_percent = get_gpu_usage();
-        system_metrics.vram_gb = get_vram_usage();
+        const auto gpu_metrics = metrics_platform_->get_system_gpu_metrics();
+        system_metrics.gpu_percent = gpu_metrics.gpu_percent;
+        system_metrics.vram_gb = gpu_metrics.vram_used_gb;
         system_metrics.npu_percent = get_npu_utilization();
 
         res.set_content(build_prometheus_metrics(*router_, system_metrics),
@@ -6948,16 +7125,6 @@ double Server::get_cpu_usage() {
 #endif
 }
 
-// Get GPU usage percentage (AMD GPUs on Linux)
-double Server::get_gpu_usage() {
-    return metrics_platform_->get_gpu_usage();
-}
-
-// Get VRAM/GTT usage in GB (AMD GPUs on Linux)
-double Server::get_vram_usage() {
-    return metrics_platform_->get_vram_usage_gb();
-}
-
 // Helper: Get NPU utilization (AMD NPU on Linux)
 double Server::get_npu_utilization() {
     return metrics_platform_->get_npu_utilization();
@@ -6979,13 +7146,16 @@ void Server::handle_system_stats(const httplib::Request& req, httplib::Response&
     // Get memory info
     stats["memory_gb"] = metrics_platform_->get_memory_usage_gb();
 
-    // GPU usage
-    double gpu_percent = get_gpu_usage();
-    stats["gpu_percent"] = (gpu_percent >= 0) ? nlohmann::json(gpu_percent) : nlohmann::json();
-
-    // VRAM usage
-    double vram_gb = get_vram_usage();
-    stats["vram_gb"] = (vram_gb >= 0) ? nlohmann::json(vram_gb) : nlohmann::json();
+    const auto gpu_metrics = metrics_platform_->get_system_gpu_metrics();
+    stats["gpu_percent"] = gpu_metrics.gpu_percent >= 0
+        ? nlohmann::json(gpu_metrics.gpu_percent)
+        : nlohmann::json();
+    stats["vram_gb"] = gpu_metrics.vram_used_gb >= 0
+        ? nlohmann::json(gpu_metrics.vram_used_gb)
+        : nlohmann::json();
+    const auto gpu_details = gpu_device_details_json(gpu_metrics);
+    stats["primary_gpu_id"] = gpu_details["primary_gpu_id"];
+    stats["gpus"] = gpu_details["gpus"];
 
     // NPU Utilization
     double npu_percent = get_npu_utilization();
@@ -7684,6 +7854,12 @@ void Server::stream_download_operation(
 
             } catch (const lemon::UnknownModelError& e) {
                 nlohmann::json error_data = {{"error", e.what()}, {"code", lemon::kUnknownModelErrorCode}};
+                std::string event = "event: error\ndata: " + error_data.dump() + "\n\n";
+                sink.write(event.c_str(), event.size());
+            } catch (const lemon::RegistryRateLimitError& e) {
+                nlohmann::json error_data = {{"error", e.what()},
+                                             {"code", lemon::kRegistryUnavailableErrorCode},
+                                             {"retry_after", e.retry_after_seconds()}};
                 std::string event = "event: error\ndata: " + error_data.dump() + "\n\n";
                 sink.write(event.c_str(), event.size());
             } catch (const std::exception& e) {

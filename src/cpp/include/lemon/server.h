@@ -108,6 +108,8 @@ private:
     // Endpoint handlers
     void handle_health(const httplib::Request& req, httplib::Response& res);
     void handle_live(const httplib::Request& req, httplib::Response& res);
+    void handle_docs(const httplib::Request& req, httplib::Response& res);
+    void handle_doc_page(const httplib::Request& req, httplib::Response& res);
     void handle_models(const httplib::Request& req, httplib::Response& res);
     void handle_model_register(const httplib::Request& req, httplib::Response& res);
     void validate_model_registration_name(const std::string& model_name,
@@ -306,7 +308,7 @@ private:
     // Shared helpers for image multipart handlers
     // Return true on success; on failure set res status/body and return false.
     bool parse_n_from_form(const httplib::Request& req, httplib::Response& res, nlohmann::json& out);
-    bool extract_image_from_form(const httplib::Request& req, httplib::Response& res, nlohmann::json& out);
+    bool extract_image_from_form(const httplib::Request& req, httplib::Response& res, nlohmann::json& out, bool allow_multiple = false);
     bool load_image_model(const nlohmann::json& request_json, httplib::Response& res);
 
     bool parse_required_json_body(const httplib::Request& req,
@@ -353,8 +355,6 @@ private:
     nlohmann::json create_model_error(const std::string& requested_model, const std::string& exception_msg);
     // System stats helper methods
     double get_cpu_usage();
-    double get_gpu_usage();
-    double get_vram_usage();
     double get_npu_utilization();
 
     std::shared_ptr<RuntimeConfig> config_;

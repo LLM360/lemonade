@@ -62,6 +62,9 @@ A **rule** is `{ id, match, route_to, outputs? }`. `route_to` must be one of
 
 A `match` is a match-expression. Combine with the logical operators `any` (OR),
 `all` (AND), and `not`; a leaf object with several keys is an implicit `all`.
+The order in which the keys of such a leaf are evaluated is not specified, so
+its entries in the decision trace may change between versions. The children of
+an explicit `all` or `any` run in list order.
 
 **Deterministic (no model needed):**
 
@@ -290,3 +293,12 @@ Unlike a `type: "llm"` classifier (which never receives `has_tools`/
 `has_images`, see above), the router always does: it's the sole decision
 mechanism here, so `prompt` can rely on them directly — e.g. "use Vision-GGUF
 when the request includes images."
+
+## Request Cancellation & Connection Robustness
+
+When an OpenAI-compatible HTTP client disconnects or times out mid-request:
+1. **Socket Progress Interception**: `utils::HttpClient` progress callbacks (`CURLOPT_XFERINFOFUNCTION`) monitor client socket liveness during prefill and generation for both streaming and non-streaming requests.
+2. **Upstream Transfer Abort**: Detecting client disconnect immediately aborts the active upstream HTTP transfer to the backend, enabling the backend process to reclaim execution slots without re-entering `Router` mutex scopes.
+3. **Isolated Disconnect Handling**: Non-streaming client disconnects return a clean HTTP 400 "Request cancelled by client" response (`ErrorType::INVALID_REQUEST`); streaming disconnects end the SSE stream. Neither triggers a nuclear model reload nor disrupts concurrent clients.
+
+This guarantee currently covers the OpenAI-compatible non-streaming endpoints (`chat/completions`, `completions`, `responses`). Non-streaming paths through the Anthropic/Ollama/MCP gateways and streaming Omni (which runs inside the SSE content-provider after the handler scope ends) are not yet covered.
